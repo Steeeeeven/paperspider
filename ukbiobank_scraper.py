@@ -27,6 +27,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict
 import queue
+from datetime import datetime
 
 
 class UKBiobankScraperSelenium:
@@ -38,14 +39,18 @@ class UKBiobankScraperSelenium:
         self.driver = None
         self.file_lock = threading.Lock()  # 文件写入锁
         self.total_saved = 0  # 已保存文章计数
+        self.progress_lock = threading.Lock()  # 进度追踪锁
+        self.pages_completed = 0  # 已完成页数
+        self.articles_completed = 0  # 已完成文章数
         self._init_driver()
     
-    def _init_driver(self):
-        """初始化Chrome WebDriver"""
+    @staticmethod
+    def _create_driver(headless: bool = True):
+        """创建独立的Chrome WebDriver实例（用于多线程）"""
         try:
             chrome_options = Options()
             
-            if self.headless:
+            if headless:
                 chrome_options.add_argument('--headless')
             
             # 添加选项以避免被检测
@@ -59,24 +64,39 @@ class UKBiobankScraperSelenium:
             chrome_options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
             
             # 使用webdriver-manager自动管理ChromeDriver
+            driver = None
             try:
                 service = Service(ChromeDriverManager().install())
-                self.driver = webdriver.Chrome(service=service, options=chrome_options)
-                print("Chrome WebDriver 初始化成功（使用webdriver-manager）")
+                driver = webdriver.Chrome(service=service, options=chrome_options)
             except Exception as e:
-                print(f"webdriver-manager失败，尝试使用系统ChromeDriver: {e}")
                 # 备用方案：尝试使用系统PATH中的ChromeDriver
-                self.driver = webdriver.Chrome(options=chrome_options)
-                print("Chrome WebDriver 初始化成功（使用系统ChromeDriver）")
+                driver = webdriver.Chrome(options=chrome_options)
             
             # 修改navigator.webdriver标志
-            self.driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
-                'source': '''
-                    Object.defineProperty(navigator, 'webdriver', {
-                        get: () => undefined
-                    })
-                '''
-            })
+            if driver:
+                driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+                    'source': '''
+                        Object.defineProperty(navigator, 'webdriver', {
+                            get: () => undefined
+                        })
+                    '''
+                })
+            
+            return driver
+            
+        except Exception as e:
+            print(f"创建WebDriver失败: {e}")
+            return None
+    
+    def _init_driver(self):
+        """初始化Chrome WebDriver"""
+        try:
+            self.driver = self._create_driver(self.headless)
+            
+            if self.driver:
+                print("Chrome WebDriver 初始化成功")
+            else:
+                raise Exception("无法创建WebDriver实例")
             
         except Exception as e:
             print(f"初始化WebDriver失败: {e}")
@@ -683,7 +703,7 @@ class UKBiobankScraperSelenium:
                 writer.writerow(publication)
             
             self.total_saved += 1
-            print(f"✓ 已保存第 {self.total_saved} 篇文章: {publication['title'][:50]}...")
+            # print(f"✓ 已保存第 {self.total_saved} 篇文章: {publication['title'][:50]}...")
     
     def append_to_json(self, publication: Dict[str, str], filename: str = 'publications.json'):
         """线程安全地追加单篇文章到JSON文件"""
@@ -740,10 +760,389 @@ class UKBiobankScraperSelenium:
         if self.driver:
             self.driver.quit()
             print("浏览器已关闭")
+    
+    def _fetch_page_concurrent(self, keyword: str, page_num: int, csv_filename: str, json_filename: str) -> Dict[str, any]:
+        """
+        使用独立浏览器实例爬取单个页面（支持并发）
+        
+        Args:
+            keyword: 搜索关键词
+            page_num: 页码
+            csv_filename: CSV文件名
+            json_filename: JSON文件名
+            
+        Returns:
+            包含爬取结果的字典 {'page': int, 'success': bool, 'articles_count': int, 'error': str}
+        """
+        driver = None
+        result = {
+            'page': page_num,
+            'success': False,
+            'articles_count': 0,
+            'error': None
+        }
+        
+        try:
+            # 创建独立的浏览器实例
+            driver = self._create_driver(self.headless)
+            
+            if not driver:
+                result['error'] = "无法创建浏览器实例"
+                return result
+            
+            # 构建URL并访问
+            url = f"{self.base_url}?_keyword={keyword}&_paged={page_num}"
+            driver.get(url)
+            time.sleep(3)
+            
+            # 获取页面HTML
+            html = driver.page_source
+            
+            if not html:
+                result['error'] = "获取HTML失败"
+                return result
+            
+            # 解析页面
+            soup = BeautifulSoup(html, 'html.parser')
+            post_list = soup.find('ul', class_='post-listing__list')
+            
+            if not post_list:
+                post_list = soup.find('ul', class_=lambda x: x and 'list' in x.lower() if x else False)
+            
+            if not post_list:
+                result['error'] = "未找到文章列表"
+                return result
+            
+            article_items = post_list.find_all('li')
+            
+            # 提取有效文章
+            valid_articles = []
+            for li in article_items:
+                pub_info = self._extract_article_info_from_list(li)
+                if pub_info and pub_info['link']:
+                    valid_articles.append(pub_info)
+            
+            if not valid_articles:
+                result['error'] = "页面无有效文章"
+                return result
+            
+            # 使用多线程获取文章详情
+            successful_count = 0
+            max_workers = min(len(valid_articles), 5)  # 每个页面最多5个线程
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_article = {}
+                for idx, pub_info in enumerate(valid_articles, 1):
+                    future = executor.submit(
+                        self._fetch_article_details_simple,
+                        pub_info,
+                        csv_filename
+                    )
+                    future_to_article[future] = pub_info
+                
+                # 等待所有任务完成
+                for future in as_completed(future_to_article):
+                    try:
+                        if future.result():
+                            successful_count += 1
+                    except Exception as e:
+                        print(f"  [页面{page_num}] 文章获取失败: {e}")
+            
+            result['success'] = True
+            result['articles_count'] = successful_count
+            
+            # 更新进度
+            with self.progress_lock:
+                self.pages_completed += 1
+                self.articles_completed += successful_count
+            
+            return result
+            
+        except Exception as e:
+            result['error'] = str(e)
+            return result
+        finally:
+            # 确保关闭浏览器实例
+            if driver:
+                try:
+                    driver.quit()
+                except:
+                    pass
+    
+    def _fetch_article_details_simple(self, pub_info: Dict[str, str], csv_filename: str) -> bool:
+        """
+        简化版获取文章详情（使用独立浏览器，用于页面级并发）
+        
+        Args:
+            pub_info: 文章基本信息
+            csv_filename: CSV文件名
+            
+        Returns:
+            是否成功
+        """
+        driver = None
+        try:
+            # 创建独立的浏览器实例
+            driver = self._create_driver(self.headless)
+            
+            if not driver:
+                return False
+            
+            # 访问详情页
+            driver.get(pub_info['link'])
+            time.sleep(2)
+            
+            # 获取页面HTML
+            html = driver.page_source
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            # 提取详细信息
+            details = {
+                'publish_date': '',
+                'pubmed_id': '',
+                'doi': '',
+                'abstract': ''
+            }
+            
+            # 提取meta信息
+            meta_items = soup.find_all('div', class_='meta__item')
+            for item in meta_items:
+                dt = item.find('dt')
+                dd = item.find('dd')
+                if dt and dd:
+                    dt_text = dt.get_text(strip=True).lower()
+                    dd_text = dd.get_text(strip=True)
+                    
+                    if 'publish date' in dt_text:
+                        details['publish_date'] = dd_text
+                    elif 'pubmed id' in dt_text:
+                        details['pubmed_id'] = dd_text
+                    elif 'doi' in dt_text:
+                        doi_link = dd.find('a')
+                        if doi_link:
+                            details['doi'] = doi_link.get_text(strip=True)
+                        else:
+                            details['doi'] = dd_text
+            
+            # 提取摘要
+            abstract_parts = []
+            abstract_header = soup.find('h2', string=lambda x: x and 'abstract' in x.lower() if x else False)
+            
+            if abstract_header:
+                current = abstract_header.find_next_sibling()
+                while current:
+                    if current.name in ['h2', 'h3', 'h4']:
+                        break
+                    if current.name == 'p':
+                        text = current.get_text(strip=True)
+                        if text:
+                            abstract_parts.append(text)
+                    current = current.find_next_sibling()
+            
+            if abstract_parts:
+                details['abstract'] = ' '.join(abstract_parts)
+            else:
+                details['abstract'] = '未找到摘要'
+            
+            # 更新文章信息
+            pub_info.update(details)
+            
+            # 保存到CSV
+            self.append_to_csv(pub_info, csv_filename)
+            
+            return True
+            
+        except Exception as e:
+            print(f"  [获取详情] 失败: {e}")
+            return False
+        finally:
+            if driver:
+                try:
+                    driver.quit()
+                except:
+                    pass
+    
+    def scrape_all_pages_concurrent(self, keyword: str = "heart", csv_filename: str = 'publications.csv', 
+                                    json_filename: str = 'publications.json', max_workers: int = 3) -> Dict[str, any]:
+        """
+        使用页面级并发爬取所有页面
+        
+        Args:
+            keyword: 搜索关键词
+            csv_filename: CSV文件名
+            json_filename: JSON文件名
+            max_workers: 最大并发页面数（建议3-5）
+            
+        Returns:
+            包含统计信息的字典
+        """
+        try:
+            # 获取总页数
+            print(f"\n步骤 1: 检测总页数...")
+            total_pages = self.get_total_pages(keyword)
+            
+            if total_pages <= 0:
+                print("无法确定总页数")
+                return {'success': False, 'error': '无法确定总页数'}
+            
+            print(f"✓ 检测到总页数: {total_pages}")
+            print(f"✓ 预计文章数: {total_pages * 10} 篇（每页约10篇）")
+            
+            # 清空现有文件
+            if os.path.exists(csv_filename):
+                os.remove(csv_filename)
+            if os.path.exists(json_filename):
+                os.remove(json_filename)
+            
+            # 重置计数器
+            self.pages_completed = 0
+            self.articles_completed = 0
+            self.total_saved = 0
+            
+            print(f"\n步骤 2: 开始并发爬取（并发数: {max_workers}）...")
+            print("=" * 80)
+            
+            start_time = time.time()
+            
+            # 使用线程池并发爬取页面
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # 提交所有页面任务
+                future_to_page = {}
+                for page_num in range(1, total_pages + 1):
+                    future = executor.submit(
+                        self._fetch_page_concurrent,
+                        keyword,
+                        page_num,
+                        csv_filename,
+                        json_filename
+                    )
+                    future_to_page[future] = page_num
+                
+                # 处理完成的任务
+                successful_pages = 0
+                failed_pages = 0
+                
+                for future in as_completed(future_to_page):
+                    page_num = future_to_page[future]
+                    try:
+                        result = future.result()
+                        
+                        if result['success']:
+                            successful_pages += 1
+                            print(f"✓ 第 {result['page']}/{total_pages} 页完成 | "
+                                  f"文章数: {result['articles_count']} | "
+                                  f"累计: {self.articles_completed} 篇 | "
+                                  f"进度: {self.pages_completed}/{total_pages}")
+                        else:
+                            failed_pages += 1
+                            print(f"✗ 第 {result['page']}/{total_pages} 页失败: {result['error']}")
+                        
+                    except Exception as e:
+                        failed_pages += 1
+                        print(f"✗ 第 {page_num}/{total_pages} 页异常: {e}")
+            
+            elapsed_time = time.time() - start_time
+            
+            # 生成JSON文件
+            print("\n" + "=" * 80)
+            print("步骤 3: 生成JSON文件...")
+            
+            try:
+                final_data = []
+                if os.path.exists(csv_filename):
+                    with open(csv_filename, 'r', encoding='utf-8-sig') as f:
+                        reader = csv.DictReader(f)
+                        for row in reader:
+                            final_data.append(row)
+                    
+                    with open(json_filename, 'w', encoding='utf-8') as f:
+                        json.dump(final_data, f, ensure_ascii=False, indent=2)
+                    
+                    print(f"✓ JSON文件生成成功")
+            except Exception as e:
+                print(f"✗ JSON文件生成失败: {e}")
+            
+            # 统计信息
+            print("\n" + "=" * 80)
+            print("爬取完成！")
+            print("=" * 80)
+            print(f"总页数: {total_pages}")
+            print(f"成功页数: {successful_pages}")
+            print(f"失败页数: {failed_pages}")
+            print(f"总文章数: {self.articles_completed}")
+            print(f"耗时: {elapsed_time:.2f} 秒")
+            print(f"平均速度: {self.articles_completed / elapsed_time:.2f} 篇/秒")
+            print(f"\n文件位置:")
+            print(f"  - CSV: {csv_filename}")
+            print(f"  - JSON: {json_filename}")
+            
+            if final_data:
+                print(f"\n数据统计:")
+                print(f"  - 有摘要: {len([p for p in final_data if p.get('abstract') and p['abstract'] not in ['未找到摘要', '获取失败']])} 篇")
+                print(f"  - 有DOI: {len([p for p in final_data if p.get('doi')])} 篇")
+                print(f"  - 有PubMed ID: {len([p for p in final_data if p.get('pubmed_id')])} 篇")
+            
+            return {
+                'success': True,
+                'total_pages': total_pages,
+                'successful_pages': successful_pages,
+                'failed_pages': failed_pages,
+                'total_articles': self.articles_completed,
+                'elapsed_time': elapsed_time
+            }
+            
+        except Exception as e:
+            print(f"\n程序执行出错: {e}")
+            return {'success': False, 'error': str(e)}
 
 
-def main():
-    """主函数 - 多线程爬取所有heart相关文章"""
+def main_concurrent():
+    """主函数 - 页面级并发爬取（推荐）"""
+    scraper = None
+    
+    try:
+        # 创建爬虫实例（headless=True为无头模式）
+        scraper = UKBiobankScraperSelenium(headless=True)
+        
+        # 目标参数
+        keyword = "heart"
+        
+        print("=" * 80)
+        print("UK Biobank 爬虫 - 页面级并发模式（性能优化版）")
+        print("=" * 80)
+        print(f"关键词: {keyword}")
+        print("目标: 获取所有相关文章（页面级并发）")
+        print("=" * 80)
+        
+        # 设置文件名
+        csv_filename = 'publications_heart_concurrent.csv'
+        json_filename = 'publications_heart_concurrent.json'
+        
+        # 使用并发爬取（max_workers=3表示同时爬取3个页面）
+        result = scraper.scrape_all_pages_concurrent(
+            keyword=keyword,
+            csv_filename=csv_filename,
+            json_filename=json_filename,
+            max_workers=3  # 可调整并发数（建议3-5，根据机器性能）
+        )
+        
+        if not result['success']:
+            print(f"爬取失败: {result.get('error', '未知错误')}")
+            
+    except KeyboardInterrupt:
+        print("\n\n用户中断程序")
+        print("已获取的数据已实时保存到文件中")
+    except Exception as e:
+        print(f"\n程序执行出错: {e}")
+        print("已获取的数据已实时保存到文件中")
+    finally:
+        # 确保关闭浏览器
+        if scraper:
+            scraper.close()
+
+
+def main_sequential():
+    """主函数 - 顺序爬取模式（兼容旧版）"""
     scraper = None
     
     try:
@@ -754,10 +1153,10 @@ def main():
         keyword = "heart"
         
         print("=" * 80)
-        print("UK Biobank 爬虫 - 多线程实时保存模式")
+        print("UK Biobank 爬虫 - 顺序爬取模式")
         print("=" * 80)
         print(f"关键词: {keyword}")
-        print("目标: 获取所有相关文章（多线程+实时保存）")
+        print("目标: 获取所有相关文章（顺序+实时保存）")
         print("=" * 80)
         
         # 第一步：检测总页数
@@ -774,7 +1173,7 @@ def main():
         print(f"预计总文章数: {total_pages * 10} 篇（每页约10篇）")
         
         # 第二步：多线程逐页爬取
-        print(f"\n步骤 2: 开始多线程逐页爬取...")
+        print(f"\n步骤 2: 开始顺序爬取...")
         print("=" * 80)
         
         # 测试模式：只爬取前5页
@@ -782,8 +1181,8 @@ def main():
         max_pages = 5 if test_mode else total_pages
         
         # 设置文件名
-        csv_filename = 'publications_heart_all.csv'
-        json_filename = 'publications_heart_all.json'
+        csv_filename = 'publications_heart_sequential.csv'
+        json_filename = 'publications_heart_sequential.json'
         
         # 清空现有文件
         if os.path.exists(csv_filename):
@@ -871,6 +1270,27 @@ def main():
         # 确保关闭浏览器
         if scraper:
             scraper.close()
+
+
+def main():
+    """主函数入口"""
+    import sys
+    
+    # 如果提供了命令行参数，根据参数选择模式
+    if len(sys.argv) > 1:
+        mode = sys.argv[1].lower()
+        if mode == 'sequential':
+            print("使用顺序爬取模式...")
+            main_sequential()
+        elif mode == 'concurrent':
+            print("使用并发爬取模式...")
+            main_concurrent()
+        else:
+            print("未知模式，使用默认并发模式...")
+            main_concurrent()
+    else:
+        # 默认使用并发模式（性能更好）
+        main_concurrent()
 
 
 if __name__ == "__main__":
