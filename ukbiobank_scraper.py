@@ -510,9 +510,17 @@ class UKBiobankScraperSelenium:
             pub_copy.update(publication)
             if isinstance(pub_copy.get('disease_areas'), list):
                 pub_copy['disease_areas'] = '; '.join(pub_copy['disease_areas'])
-            # 写回或追加
+            # 写回或追加（合并旧值，避免清空已有字段，如 page）
             if pub_copy['link'] in existing_index:
-                rows[existing_index[pub_copy['link']]] = pub_copy
+                idx = existing_index[pub_copy['link']]
+                existing_row = rows[idx]
+                merged = existing_row.copy()
+                for key in fieldnames:
+                    new_val = pub_copy.get(key, '')
+                    # 若新值非空则覆盖；否则保留旧值（确保不会清空如 page 之类已存在字段）
+                    if new_val not in [None, '', []]:
+                        merged[key] = new_val
+                rows[idx] = merged
             else:
                 rows.append(pub_copy)
             with open(filename, 'w', encoding='utf-8-sig', newline='') as f:
