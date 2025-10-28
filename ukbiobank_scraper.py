@@ -7,10 +7,15 @@ UK Biobank出版物爬虫 - Selenium版本
 
 import sys
 import os
+import signal
+import atexit
+import psutil
 
 # 修复Windows控制台编码问题
 if sys.platform == 'win32':
     os.system('chcp 65001 >nul 2>&1')
+
+from typing import List, Dict
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -25,7 +30,6 @@ import csv
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict
 import queue
 from datetime import datetime
 
@@ -33,7 +37,7 @@ from datetime import datetime
 class UKBiobankScraperSelenium:
     """UK Biobank出版物爬虫类 - 使用Selenium"""
     
-    def __init__(self, base_url: str = "https://www.ukbiobank.ac.uk/discoveries-and-impact/publications/", headless: bool = False):
+    def __init__(self, base_url="https://www.ukbiobank.ac.uk/discoveries-and-impact/publications/", headless=False):
         self.base_url = base_url
         self.headless = headless
         self.driver = None
@@ -42,10 +46,71 @@ class UKBiobankScraperSelenium:
         self.progress_lock = threading.Lock()  # 进度追踪锁
         self.pages_completed = 0  # 已完成页数
         self.articles_completed = 0  # 已完成文章数
+        self.should_stop = False  # 停止标志
+        self.active_drivers = []  # 活跃的浏览器实例列表
         self._init_driver()
+        self._setup_signal_handlers()
+        # 查询条件与起始时间（用于进度文件）
+        self.filter_query = {
+            'publication_date_from': '2020-01-01'
+        }
+        self.run_start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    def _setup_signal_handlers(self):
+        """设置信号处理器"""
+        def signal_handler(signum, frame):
+            print("\n\n收到中断信号，正在安全停止程序...")
+            self.should_stop = True
+            self._force_cleanup()
+            sys.exit(0)
+        
+        # 注册信号处理器
+        signal.signal(signal.SIGINT, signal_handler)
+        if hasattr(signal, 'SIGTERM'):
+            signal.signal(signal.SIGTERM, signal_handler)
+        
+        # 注册退出时的清理函数
+        atexit.register(self._force_cleanup)
+    
+    def _force_cleanup(self):
+        """强制清理所有资源"""
+        print("正在清理资源...")
+        
+        # 关闭主浏览器
+        if self.driver:
+            try:
+                self.driver.quit()
+                print("主浏览器已关闭")
+            except:
+                pass
+        
+        # 关闭所有活跃的浏览器实例
+        for driver in self.active_drivers:
+            try:
+                driver.quit()
+            except:
+                pass
+        
+        # 强制杀死Chrome进程
+        self._kill_chrome_processes()
+        
+        print("资源清理完成")
+    
+    def _kill_chrome_processes(self):
+        """强制杀死Chrome相关进程"""
+        try:
+            for proc in psutil.process_iter(['pid', 'name']):
+                try:
+                    if 'chrome' in proc.info['name'].lower():
+                        proc.terminate()
+                        print(f"已终止Chrome进程: {proc.info['pid']}")
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        except Exception as e:
+            print(f"清理Chrome进程时出错: {e}")
     
     @staticmethod
-    def _create_driver(headless: bool = True):
+    def _create_driver(headless=True):
         """创建独立的Chrome WebDriver实例（用于多线程）"""
         try:
             chrome_options = Options()
@@ -75,12 +140,12 @@ class UKBiobankScraperSelenium:
             # 修改navigator.webdriver标志
             if driver:
                 driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
-                    'source': '''
-                        Object.defineProperty(navigator, 'webdriver', {
-                            get: () => undefined
-                        })
-                    '''
-                })
+                'source': '''
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: () => undefined
+                    })
+                '''
+            })
             
             return driver
             
@@ -110,12 +175,9 @@ class UKBiobankScraperSelenium:
             print("- 手动下载ChromeDriver并添加到PATH")
             raise
     
-    def get_total_pages(self, keyword: str = "heart") -> int:
+    def get_total_pages(self):
         """
         获取搜索结果的总页数
-        
-        Args:
-            keyword: 搜索关键词
             
         Returns:
             总页数，如果无法获取则返回-1
@@ -126,11 +188,11 @@ class UKBiobankScraperSelenium:
         
         try:
             # 直接访问搜索页面（不添加page参数）
-            url = f"{self.base_url}?_keyword={keyword}"
+            url = f"{self.base_url}?_publication_date=2020-01-01%2C"
             print(f"正在检测总页数: {url}")
             
             self.driver.get(url)
-            time.sleep(3)
+            time.sleep(2)
             
             # 获取页面HTML
             html = self.driver.page_source
@@ -158,252 +220,31 @@ class UKBiobankScraperSelenium:
                     print(f"无法从计数文本中提取总数: {counts_text}")
             else:
                 print("未找到facetwp-facet-counts元素")
-            
-            # 如果没找到计数元素，尝试其他方法
-            print("尝试其他方法获取总页数...")
-            
-            # 查找分页信息，通常包含在pagination相关的元素中
-            pagination_selectors = [
-                'nav[class*="pagination"]',
-                'div[class*="pagination"]',
-                'ul[class*="pagination"]',
-                '.pagination',
-                '.page-numbers',
-                '.pager'
-            ]
-            
-            total_pages = -1
-            
-            for selector in pagination_selectors:
-                pagination = soup.select_one(selector)
-                if pagination:
-                    # 查找包含数字的链接
-                    page_links = pagination.find_all('a')
-                    page_numbers = []
-                    
-                    for link in page_links:
-                        text = link.get_text(strip=True)
-                        if text.isdigit():
-                            page_numbers.append(int(text))
-                    
-                    if page_numbers:
-                        total_pages = max(page_numbers)
-                        print(f"通过分页元素检测到总页数: {total_pages}")
-                        break
-            
-            # 如果仍然没找到，使用默认值
-            if total_pages == -1:
-                total_pages = 50  # 默认值
-                print(f"使用默认页数: {total_pages}")
-            
-            return total_pages
-            
+                return -1
         except Exception as e:
             print(f"获取总页数失败: {e}")
-            return 50  # 返回默认值
+            return -1  # 返回默认值
     
-    def fetch_page(self, keyword: str = "heart", page: int = 2) -> str:
-        """
-        获取指定页面的HTML内容
-        
-        Args:
-            keyword: 搜索关键词
-            page: 页码
-            
-        Returns:
-            HTML内容字符串
-        """
-        if not self.driver:
-            print("WebDriver未初始化")
-            return ""
-        
-        try:
-            # 构建完整URL
-            url = f"{self.base_url}?_keyword={keyword}&_paged={page}"
-            print(f"正在访问: {url}")
-            
-            # 访问页面
-            self.driver.get(url)
-            
-            # 等待页面加载
-            time.sleep(3)
-            
-            # 等待文章元素加载
-            try:
-                WebDriverWait(self.driver, 10).until(
-                    EC.presence_of_element_located((By.TAG_NAME, "post-listing__list"))
-                )
-            except:
-                print("未找到article列表：标签[post-listing__list]页面可能使用不同结构")
-            
-            # 获取页面HTML
-            html = self.driver.page_source
-            
-            return html
-            
-        except Exception as e:
-            print(f"获取页面失败: {e}")
-            return ""
     
-    def save_html_for_debug(self, html: str, filename: str = "debug_page.html"):
-        """保存HTML用于调试"""
-        with open(filename, 'w', encoding='utf-8') as f:
-            f.write(html)
-        print(f"调试HTML已保存到: {filename}")
     
-    def parse_publications(self, html: str, fetch_details: bool = True) -> List[Dict[str, str]]:
-        """
-        解析HTML内容，提取文章信息
-        
-        Args:
-            html: HTML内容字符串
-            fetch_details: 是否获取文章详细信息（包括摘要）
-            
-        Returns:
-            包含文章信息的字典列表
-        """
-        soup = BeautifulSoup(html, 'html.parser')
-        publications = []
-        
-        # 查找 post-listing__list 下的所有 li 元素
-        post_list = soup.find('ul', class_='post-listing__list')
-        
-        if not post_list:
-            print("未找到 post-listing__list，尝试其他选择器...")
-            # 备用方案：查找包含 li 的列表
-            post_list = soup.find('ul', class_=lambda x: x and 'list' in x.lower() if x else False)
-        
-        if post_list:
-            article_items = post_list.find_all('li')
-            print(f"找到 {len(article_items)} 篇文章")
-        else:
-            print("未找到文章列表")
-            return publications
-        
-        total = len(article_items)
-        for idx, li in enumerate(article_items, 1):
-            pub_info = self._extract_article_info_from_list(li)
-            if pub_info and pub_info['link']:
-                # 获取详细信息
-                if fetch_details:
-                    print(f"正在获取第 {idx}/{total} 篇文章的详细信息...")
-                    details = self._fetch_article_details(pub_info['link'])
-                    pub_info.update(details)
-                
-                publications.append(pub_info)
-        
-        return publications
     
-    def parse_publications_multithread(self, html: str, page_num: int, csv_filename: str = 'publications.csv', json_filename: str = 'publications.json', fallback_to_single_thread: bool = True) -> int:
-        """
-        多线程解析HTML内容，提取文章信息并实时保存
-        
-        Args:
-            html: HTML内容字符串
-            page_num: 页码（用于日志显示）
-            csv_filename: CSV文件名
-            json_filename: JSON文件名
-            
-        Returns:
-            成功获取的文章数量
-        """
-        soup = BeautifulSoup(html, 'html.parser')
-        
-        # 查找 post-listing__list 下的所有 li 元素
-        post_list = soup.find('ul', class_='post-listing__list')
-        
-        if not post_list:
-            print("未找到 post-listing__list，尝试其他选择器...")
-            # 备用方案：查找包含 li 的列表
-            post_list = soup.find('ul', class_=lambda x: x and 'list' in x.lower() if x else False)
-        
-        if not post_list:
-            print("未找到文章列表")
-            return 0
-        
-        article_items = post_list.find_all('li')
-        # print(f"第 {page_num} 页找到 {len(article_items)} 个文章元素，开始多线程获取详细信息...")
-        
-        if not article_items:
-            return 0
-        
-        # 先统计有效文章数量
-        valid_articles = []
-        for li in article_items:
-            pub_info = self._extract_article_info_from_list(li)
-            if pub_info and pub_info['link']:
-                valid_articles.append(pub_info)
-        
-        print(f"第 {page_num} 页文章数量: {len(valid_articles)} 篇")
-        
-        if not valid_articles:
-            return 0
-        
-        # 创建线程池，每页最多10个线程
-        max_workers = min(len(valid_articles), 10)
-        successful_count = 0
-        
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # 提交所有任务
-            future_to_article = {}
-            for idx, pub_info in enumerate(valid_articles, 1):
-                future = executor.submit(self._fetch_and_save_article, pub_info, idx, page_num, csv_filename, json_filename)
-                future_to_article[future] = pub_info
-            
-            # 处理完成的任务
-            for future in as_completed(future_to_article):
-                try:
-                    success = future.result()
-                    if success:
-                        successful_count += 1
-                except Exception as e:
-                    print(f"线程执行出错: {e}")
-        
-        print(f"第 {page_num} 页完成，成功获取 {successful_count}/{len(valid_articles)} 篇文章")
-        return successful_count
     
-    def _fetch_and_save_article(self, pub_info: Dict[str, str], article_idx: int, page_num: int, csv_filename: str, json_filename: str) -> bool:
-        """
-        获取单篇文章的详细信息并保存
-        
-        Args:
-            pub_info: 文章基本信息
-            article_idx: 文章在页面中的索引
-            page_num: 页码
-            csv_filename: CSV文件名
-            json_filename: JSON文件名
-            
-        Returns:
-            是否成功获取和保存
-        """
-        try:
-            print(f"  [线程] 正在获取第 {page_num} 页第 {article_idx} 篇文章: {pub_info['title'][:50]}...")
-            
-            # 获取详细信息（使用多线程版本）
-            details = self._fetch_article_details_multithread(pub_info['link'])
-            pub_info.update(details)
-            
-            # 实时保存到文件（只保存一次）
-            self.append_to_csv(pub_info, csv_filename)
-            
-            return True
-            
-        except Exception as e:
-            print(f"  [线程] 获取文章失败: {e}")
-            return False
     
-    def _extract_article_info_from_list(self, li_element) -> Dict[str, str]:
-        """从列表页的li元素中提取基本信息"""
+    def _extract_article_info_from_list(self, li_element):
+        """从列表页的li元素中提取基本信息（只保留标题和链接）"""
         info = {
+            'page': '',
             'title': '',
-            'date': '',
-            'authors': '',
-            'journal': '',
             'link': '',
-            'publish_date': '',
-            'pubmed_id': '',
-            'doi': '',
-            'abstract': ''
+            'disease_areas': [],  # 疾病领域数组
+            'last_updated': '',   # 最后更新时间
+            'authors': '',        # 作者
+            'publish_date': '',   # 发布日期
+            'journal': '',        # 期刊
+            'pubmed_id': '',      # PubMed ID
+            'doi': '',           # DOI
+            'abstract': '',        # 摘要
+            'details_saved': '否'
         }
         
         # 提取标题和链接
@@ -416,276 +257,215 @@ class UKBiobankScraperSelenium:
             elif href.startswith('/'):
                 info['link'] = f"https://www.ukbiobank.ac.uk{href}"
         
-        # 提取日期
-        time_elem = li_element.find('time', class_='card__date')
-        if time_elem:
-            info['date'] = time_elem.get_text(strip=True)
-        
-        # 提取作者和期刊（从meta列表中）
-        meta_items = li_element.find_all('div', class_='meta__item')
-        for item in meta_items:
-            dt = item.find('dt')
-            dd = item.find('dd')
-            if dt and dd:
-                dt_text = dt.get_text(strip=True).lower()
-                if 'author' in dt_text:
-                    info['authors'] = dd.get_text(strip=True)
-                elif 'journal' in dt_text:
-                    info['journal'] = dd.get_text(strip=True)
-        
         return info if info['title'] and info['link'] else None
     
-    def _fetch_article_details(self, url: str) -> Dict[str, str]:
-        """访问论文详情页获取完整信息（单线程版本）"""
+    def _fetch_article_details_multithread(self, url, max_retries=3):
+        """访问论文详情页获取完整信息（多线程版本，使用独立浏览器实例，带重试机制）"""
         details = {
-            'publish_date': '',
-            'pubmed_id': '',
-            'doi': '',
-            'abstract': ''
-        }
-        
-        if not url or not self.driver:
-            return details
-        
-        try:
-            time.sleep(2)  # 延迟
-            
-            # 打开新标签页
-            self.driver.execute_script("window.open('');")
-            self.driver.switch_to.window(self.driver.window_handles[-1])
-            
-            # 访问详情页
-            self.driver.get(url)
-            time.sleep(2)
-            
-            # 获取页面HTML
-            html = self.driver.page_source
-            soup = BeautifulSoup(html, 'html.parser')
-            
-            # 提取详细信息（从meta列表中）
-            meta_items = soup.find_all('div', class_='meta__item')
-            for item in meta_items:
-                dt = item.find('dt')
-                dd = item.find('dd')
-                if dt and dd:
-                    dt_text = dt.get_text(strip=True).lower()
-                    dd_text = dd.get_text(strip=True)
-                    
-                    if 'publish date' in dt_text:
-                        details['publish_date'] = dd_text
-                    elif 'pubmed id' in dt_text:
-                        details['pubmed_id'] = dd_text
-                    elif 'doi' in dt_text:
-                        # DOI可能包含链接，提取文本
-                        doi_link = dd.find('a')
-                        if doi_link:
-                            details['doi'] = doi_link.get_text(strip=True)
-                        else:
-                            details['doi'] = dd_text
-            
-            # 提取摘要：找到 <h2>Abstract</h2> 后的所有 <p> 标签
-            abstract_parts = []
-            abstract_header = soup.find('h2', string=lambda x: x and 'abstract' in x.lower() if x else False)
-            
-            if abstract_header:
-                # 获取h2后面的所有p标签，直到遇到下一个h2或h3
-                current = abstract_header.find_next_sibling()
-                while current:
-                    if current.name in ['h2', 'h3', 'h4']:
-                        break
-                    if current.name == 'p':
-                        text = current.get_text(strip=True)
-                        if text:
-                            abstract_parts.append(text)
-                    current = current.find_next_sibling()
-            
-            if abstract_parts:
-                details['abstract'] = ' '.join(abstract_parts)
-            else:
-                details['abstract'] = '未找到摘要'
-            
-            # 关闭当前标签页，返回主标签页
-            self.driver.close()
-            self.driver.switch_to.window(self.driver.window_handles[0])
-            
-            return details
-            
-        except Exception as e:
-            print(f"  获取详细信息失败: {e}")
-            # 确保返回主标签页
-            try:
-                if len(self.driver.window_handles) > 1:
-                    self.driver.close()
-                    self.driver.switch_to.window(self.driver.window_handles[0])
-            except:
-                pass
-            return details
-    
-    def _fetch_article_details_multithread(self, url: str) -> Dict[str, str]:
-        """访问论文详情页获取完整信息（多线程版本，使用独立浏览器实例）"""
-        details = {
-            'publish_date': '',
-            'pubmed_id': '',
-            'doi': '',
-            'abstract': ''
+            'disease_areas': [],  # 疾病领域数组
+            'last_updated': '',   # 最后更新时间
+            'authors': '',        # 作者
+            'publish_date': '',   # 发布日期
+            'journal': '',        # 期刊
+            'pubmed_id': '',      # PubMed ID
+            'doi': '',           # DOI
+            'abstract': ''        # 摘要
         }
         
         if not url:
             return details
         
-        # 为多线程创建独立的浏览器实例
-        driver = None
-        try:
-            # 创建独立的Chrome实例
-            chrome_options = Options()
-            if self.headless:
-                chrome_options.add_argument('--headless')
-            
-            # 添加选项以避免被检测
-            chrome_options.add_argument('--disable-blink-features=AutomationControlled')
-            chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-            chrome_options.add_experimental_option('useAutomationExtension', False)
-            chrome_options.add_argument('--no-sandbox')
-            chrome_options.add_argument('--disable-dev-shm-usage')
-            chrome_options.add_argument('--disable-gpu')
-            chrome_options.add_argument('--window-size=1920,1080')
-            chrome_options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
-            
-            # 使用更稳定的驱动管理方式
+        for attempt in range(max_retries):
             driver = None
-            driver_created = False
-            
-            # 方案1：尝试使用webdriver-manager（带重试机制）
-            for attempt in range(3):
-                try:
-                    service = Service(ChromeDriverManager().install())
-                    driver = webdriver.Chrome(service=service, options=chrome_options)
-                    driver_created = True
-                    break
-                except Exception as e:
-                    print(f"  webdriver-manager尝试 {attempt + 1}/3 失败: {e}")
-                    if attempt < 2:  # 不是最后一次尝试
-                        time.sleep(2)  # 等待2秒后重试
-                        continue
-            
-            # 方案2：如果webdriver-manager失败，尝试使用系统PATH中的ChromeDriver
-            if not driver_created:
-                try:
-                    driver = webdriver.Chrome(options=chrome_options)
-                    driver_created = True
-                except Exception as e:
-                    print(f"  系统ChromeDriver也失败: {e}")
-            
-            # 方案3：如果都失败，尝试手动指定驱动路径
-            if not driver_created:
-                try:
-                    # 尝试常见的ChromeDriver路径
-                    possible_paths = [
-                        r"C:\Program Files\Google\Chrome\Application\chromedriver.exe",
-                        r"C:\Program Files (x86)\Google\Chrome\Application\chromedriver.exe",
-                        r"C:\Users\{}\AppData\Local\Google\Chrome\Application\chromedriver.exe".format(os.getenv('USERNAME', '')),
-                        r"C:\chromedriver.exe"
-                    ]
-                    
-                    for path in possible_paths:
-                        if os.path.exists(path):
-                            service = Service(path)
-                            driver = webdriver.Chrome(service=service, options=chrome_options)
-                            driver_created = True
-                            print(f"  使用手动路径成功: {path}")
-                            break
-                except Exception as e:
-                    print(f"  手动路径也失败: {e}")
-            
-            # 如果所有方案都失败，返回空结果
-            if not driver_created:
-                print("  所有Chrome驱动方案都失败，跳过此文章")
-                return details
-            
-            # 访问详情页
-            driver.get(url)
-            time.sleep(3)  # 增加等待时间确保页面加载完成
-            
-            # 获取页面HTML
-            html = driver.page_source
-            soup = BeautifulSoup(html, 'html.parser')
-            
-            # 提取详细信息（从meta列表中）
-            meta_items = soup.find_all('div', class_='meta__item')
-            for item in meta_items:
-                dt = item.find('dt')
-                dd = item.find('dd')
-                if dt and dd:
-                    dt_text = dt.get_text(strip=True).lower()
-                    dd_text = dd.get_text(strip=True)
-                    
-                    if 'publish date' in dt_text:
-                        details['publish_date'] = dd_text
-                    elif 'pubmed id' in dt_text:
-                        details['pubmed_id'] = dd_text
-                    elif 'doi' in dt_text:
-                        # DOI可能包含链接，提取文本
-                        doi_link = dd.find('a')
-                        if doi_link:
-                            details['doi'] = doi_link.get_text(strip=True)
-                        else:
-                            details['doi'] = dd_text
-            
-            # 提取摘要：找到 <h2>Abstract</h2> 后的所有 <p> 标签
-            abstract_parts = []
-            abstract_header = soup.find('h2', string=lambda x: x and 'abstract' in x.lower() if x else False)
-            
-            if abstract_header:
-                # 获取h2后面的所有p标签，直到遇到下一个h2或h3
-                current = abstract_header.find_next_sibling()
-                while current:
-                    if current.name in ['h2', 'h3', 'h4']:
+            try:
+                # 创建独立的Chrome实例
+                chrome_options = Options()
+                if self.headless:
+                    chrome_options.add_argument('--headless')
+                
+                # 添加选项以避免被检测
+                chrome_options.add_argument('--disable-blink-features=AutomationControlled')
+                chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+                chrome_options.add_experimental_option('useAutomationExtension', False)
+                chrome_options.add_argument('--no-sandbox')
+                chrome_options.add_argument('--disable-dev-shm-usage')
+                chrome_options.add_argument('--disable-gpu')
+                chrome_options.add_argument('--window-size=1920,1080')
+                chrome_options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+                
+                # 使用更稳定的驱动管理方式
+                driver = None
+                driver_created = False
+                
+                # 方案1：尝试使用webdriver-manager（带重试机制）
+                for driver_attempt in range(3):
+                    try:
+                        service = Service(ChromeDriverManager().install())
+                        driver = webdriver.Chrome(service=service, options=chrome_options)
+                        driver_created = True
                         break
-                    if current.name == 'p':
-                        text = current.get_text(strip=True)
-                        if text:
-                            abstract_parts.append(text)
-                    current = current.find_next_sibling()
+                    except Exception as e:
+                        print(f"  webdriver-manager尝试 {driver_attempt + 1}/3 失败: {e}")
+                        if driver_attempt < 2:  # 不是最后一次尝试
+                            time.sleep(2)  # 等待2秒后重试
+                            continue
+                
+                # 方案2：如果webdriver-manager失败，尝试使用系统PATH中的ChromeDriver
+                if not driver_created:
+                    try:
+                        driver = webdriver.Chrome(options=chrome_options)
+                        driver_created = True
+                    except Exception as e:
+                        print(f"  系统ChromeDriver也失败: {e}")
+                
+                # 方案3：如果都失败，尝试手动指定驱动路径
+                if not driver_created:
+                    try:
+                        # 尝试常见的ChromeDriver路径
+                        possible_paths = [
+                            r"C:\Program Files\Google\Chrome\Application\chromedriver.exe",
+                            r"C:\Program Files (x86)\Google\Chrome\Application\chromedriver.exe",
+                            r"C:\Users\{}\AppData\Local\Google\Chrome\Application\chromedriver.exe".format(os.getenv('USERNAME', '')),
+                            r"C:\chromedriver.exe"
+                        ]
+                        
+                        for path in possible_paths:
+                            if os.path.exists(path):
+                                service = Service(path)
+                                driver = webdriver.Chrome(service=service, options=chrome_options)
+                                driver_created = True
+                                print(f"  使用手动路径成功: {path}")
+                                break
+                    except Exception as e:
+                        print(f"  手动路径也失败: {e}")
+                
+                # 如果所有方案都失败，返回空结果
+                if not driver_created:
+                    print(f"  所有Chrome驱动方案都失败，跳过此文章 (尝试 {attempt + 1}/{max_retries})")
+                    if attempt < max_retries - 1:
+                        time.sleep((attempt + 1) * 2)
+                        continue
+                    return details
+                
+                # 访问详情页
+                driver.get(url)
+                time.sleep(3)  # 增加等待时间确保页面加载完成
+                
+                # 获取页面HTML
+                html = driver.page_source
+                
+                # 验证HTML是否有效
+                if not html or len(html) < 1000:
+                    print(f"  HTML内容异常，长度: {len(html) if html else 0} (尝试 {attempt + 1}/{max_retries})")
+                    if attempt < max_retries - 1:
+                        time.sleep((attempt + 1) * 2)
+                        continue
+                    return details
+                
+                soup = BeautifulSoup(html, 'html.parser')
+                
+                # 提取articleHeader的三个部分
+                article_header = soup.find('header', class_='articleHeader')
+                if article_header:
+                    # 第一部分：articleHeader__tags - Disease areas
+                    tags_section = article_header.find('div', class_='articleHeader__tags')
+                    if tags_section:
+                        # 查找Disease areas
+                        disease_areas_dt = tags_section.find('dt', string=lambda x: x and 'disease areas' in x.lower() if x else False)
+                        if disease_areas_dt:
+                            disease_areas_dd = disease_areas_dt.find_next_sibling('dd')
+                            if disease_areas_dd:
+                                # 提取所有tag
+                                tag_elements = disease_areas_dd.find_all('span', class_='tag')
+                                details['disease_areas'] = [tag.get_text(strip=True) for tag in tag_elements]
+                    
+                    # 第二部分：articleHeader__date - Last updated
+                    date_section = article_header.find('div', class_='articleHeader__date')
+                    if date_section:
+                        last_updated_dt = date_section.find('dt', string=lambda x: x and 'last updated' in x.lower() if x else False)
+                        if last_updated_dt:
+                            last_updated_dd = last_updated_dt.find_next_sibling('dd')
+                            if last_updated_dd:
+                                time_elem = last_updated_dd.find('time')
+                                if time_elem:
+                                    details['last_updated'] = time_elem.get_text(strip=True)
+                    
+                    # 第三部分：articleHeader__meta - 作者、发布日期、期刊、PubMed ID、DOI
+                    meta_section = article_header.find('div', class_='articleHeader__meta')
+                    if meta_section:
+                        meta_items = meta_section.find_all('div', class_='meta__item')
+                        for item in meta_items:
+                            dt = item.find('dt')
+                            dd = item.find('dd')
+                            if dt and dd:
+                                dt_text = dt.get_text(strip=True).lower()
+                                dd_text = dd.get_text(strip=True)
+                                
+                                if 'author' in dt_text:
+                                    details['authors'] = dd_text
+                                elif 'publish date' in dt_text:
+                                    details['publish_date'] = dd_text
+                                elif 'journal' in dt_text:
+                                    details['journal'] = dd_text
+                                elif 'pubmed id' in dt_text:
+                                    details['pubmed_id'] = dd_text
+                                elif 'doi' in dt_text:
+                                    # DOI可能包含链接，提取文本
+                                    doi_link = dd.find('a')
+                                    if doi_link:
+                                        details['doi'] = doi_link.get_text(strip=True)
+                                    else:
+                                        details['doi'] = dd_text
+                
+                # 提取摘要：找到 <h2>Abstract</h2> 后的所有 <p> 标签
+                abstract_parts = []
+                abstract_header = soup.find('h2', string=lambda x: x and 'abstract' in x.lower() if x else False)
+                
+                if abstract_header:
+                    # 获取h2后面的所有p标签，直到遇到下一个h2或h3
+                    current = abstract_header.find_next_sibling()
+                    while current:
+                        if current.name in ['h2', 'h3', 'h4']:
+                            break
+                        if current.name == 'p':
+                            text = current.get_text(strip=True)
+                            if text:
+                                abstract_parts.append(text)
+                        current = current.find_next_sibling()
+                
+                if abstract_parts:
+                    details['abstract'] = ' '.join(abstract_parts)
+                    print(f"  [调试] 找到摘要，长度: {len(details['abstract'])}")
+                else:
+                    details['abstract'] = '未找到摘要'
+                
+                # 验证是否获取到有效信息
+                if details['title'] or details['authors'] or details['abstract'] != '未找到摘要':
+                    print(f"  ✓ 文章详情获取成功 (尝试 {attempt + 1}/{max_retries})")
+                    return details
+                else:
+                    print(f"  ✗ 文章详情内容为空 (尝试 {attempt + 1}/{max_retries})")
+                    
+            except Exception as e:
+                print(f"  获取详细信息失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+                
+            finally:
+                # 确保关闭独立的浏览器实例
+                if driver:
+                    try:
+                        driver.quit()
+                    except:
+                        pass
             
-            if abstract_parts:
-                details['abstract'] = ' '.join(abstract_parts)
-                print(f"  [调试] 找到摘要，长度: {len(details['abstract'])}")
-            else:
-                details['abstract'] = '未找到摘要'
-            
-            return details
-            
-        except Exception as e:
-            print(f"  获取详细信息失败: {e}")
-            return details
-        finally:
-            # 确保关闭独立的浏览器实例
-            if driver:
-                try:
-                    driver.quit()
-                except:
-                    pass
-    
-    def save_to_json(self, publications: List[Dict[str, str]], filename: str = 'publications.json'):
-        """将数据保存为JSON文件"""
-        with self.file_lock:
-            with open(filename, 'w', encoding='utf-8') as f:
-                json.dump(publications, f, ensure_ascii=False, indent=2)
-            print(f"数据已保存到 {filename}")
-    
-    def save_to_csv(self, publications: List[Dict[str, str]], filename: str = 'publications.csv'):
-        """将数据保存为CSV文件"""
-        if not publications:
-            print("没有数据可保存")
-            return
+            # 如果不是最后一次尝试，等待后重试
+            if attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 2
+                print(f"  等待 {wait_time} 秒后重试...")
+                time.sleep(wait_time)
         
-        with self.file_lock:
-            fieldnames = ['title', 'date', 'authors', 'journal', 'publish_date', 'pubmed_id', 'doi', 'link', 'abstract']
-            with open(filename, 'w', encoding='utf-8-sig', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(publications)
-            print(f"数据已保存到 {filename}")
+        print(f"  ✗ 文章详情获取失败，已重试 {max_retries} 次")
+        return details
+    
     
     def append_to_csv(self, publication: Dict[str, str], filename: str = 'publications.csv'):
         """线程安全地追加单篇文章到CSV文件"""
@@ -693,83 +473,199 @@ class UKBiobankScraperSelenium:
             return
         
         with self.file_lock:
-            fieldnames = ['title', 'date', 'authors', 'journal', 'publish_date', 'pubmed_id', 'doi', 'link', 'abstract']
+            fieldnames = ['page', 'title', 'link', 'disease_areas', 'last_updated', 'authors', 'publish_date', 'journal', 'pubmed_id', 'doi', 'abstract', 'details_saved']
             file_exists = os.path.exists(filename)
+            
+            # 处理disease_areas数组，转换为字符串
+            pub_copy = publication.copy()
+            if isinstance(pub_copy.get('disease_areas'), list):
+                pub_copy['disease_areas'] = '; '.join(pub_copy['disease_areas'])
             
             with open(filename, 'a', encoding='utf-8-sig', newline='') as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 if not file_exists:
                     writer.writeheader()
-                writer.writerow(publication)
+                writer.writerow(pub_copy)
             
             self.total_saved += 1
             # print(f"✓ 已保存第 {self.total_saved} 篇文章: {publication['title'][:50]}...")
-    
-    def append_to_json(self, publication: Dict[str, str], filename: str = 'publications.json'):
-        """线程安全地追加单篇文章到JSON文件"""
-        if not publication:
+
+    def upsert_to_csv(self, publication: Dict[str, str], filename: str = 'publications.csv'):
+        """按link作为唯一键进行CSV更新/插入，并保证字段齐全"""
+        if not publication or not publication.get('link'):
             return
-        
+        fieldnames = ['page', 'title', 'link', 'disease_areas', 'last_updated', 'authors', 'publish_date', 'journal', 'pubmed_id', 'doi', 'abstract', 'details_saved']
         with self.file_lock:
-            # 读取现有数据
-            existing_data = []
+            rows = []
+            existing_index = {}
             if os.path.exists(filename):
-                try:
-                    with open(filename, 'r', encoding='utf-8') as f:
-                        existing_data = json.load(f)
-                except (json.JSONDecodeError, FileNotFoundError):
-                    existing_data = []
-            
-            # 添加新文章
-            existing_data.append(publication)
-            
-            # 写回文件
-            with open(filename, 'w', encoding='utf-8') as f:
-                json.dump(existing_data, f, ensure_ascii=False, indent=2)
-            
-            self.total_saved += 1
-            print(f"✓ 已保存第 {self.total_saved} 篇文章: {publication['title'][:50]}...")
+                with open(filename, 'r', encoding='utf-8-sig', newline='') as f:
+                    reader = csv.DictReader(f)
+                    for i, row in enumerate(reader):
+                        rows.append(row)
+                        if row.get('link'):
+                            existing_index[row['link']] = i
+            # 规范化待写入数据
+            pub_copy = {k: '' for k in fieldnames}
+            pub_copy.update(publication)
+            if isinstance(pub_copy.get('disease_areas'), list):
+                pub_copy['disease_areas'] = '; '.join(pub_copy['disease_areas'])
+            # 写回或追加
+            if pub_copy['link'] in existing_index:
+                rows[existing_index[pub_copy['link']]] = pub_copy
+            else:
+                rows.append(pub_copy)
+            with open(filename, 'w', encoding='utf-8-sig', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow(row)
     
-    def print_publications(self, publications: List[Dict[str, str]]):
-        """在控制台打印文章信息"""
-        if not publications:
-            print("未找到任何文章")
+    
+    
+    def _load_progress(self, progress_filename: str) -> Dict:
+        """加载进度文件"""
+        if os.path.exists(progress_filename):
+            try:
+                with open(progress_filename, 'r', encoding='utf-8') as f:
+                    progress = json.load(f)
+                print(f"✓ 发现进度文件: {progress_filename}")
+                print(f"  - 总页数: {progress.get('total_pages', 0)}")
+                print(f" - 已完成: {len(progress.get('completed_pages', []))} 页")
+                print(f"  - 失败页: {len(progress.get('failed_pages', []))} 页")
+                print(f"  - 已获取文章: {progress.get('total_articles', 0)} 篇")
+                print(f"  - 最后更新: {progress.get('last_update', '未知')}")
+                return progress
+            except Exception as e:
+                print(f"✗ 加载进度文件失败: {e}")
+                return {}
+        return {}
+    
+    def _save_progress(self, progress: Dict, progress_filename: str):
+        """保存进度文件"""
+        try:
+            progress['last_update'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            # 保存本次运行信息
+            progress['run_start_time'] = getattr(self, 'run_start_time', progress.get('run_start_time', ''))
+            progress['filters'] = getattr(self, 'filter_query', progress.get('filters', {}))
+            with open(progress_filename, 'w', encoding='utf-8') as f:
+                json.dump(progress, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"保存进度文件失败: {e}")
+    
+    def _get_pending_pages(self, total_pages: int, progress: Dict) -> List[int]:
+        """获取待处理的页面列表"""
+        completed_pages = set(progress.get('completed_pages', []))
+        failed_pages = set(progress.get('failed_pages', []))
+        
+        # 优先重试失败的页面，然后处理新页面
+        pending_pages = list(failed_pages) + [p for p in range(1, total_pages + 1) if p not in completed_pages]
+        
+        # 去重并排序
+        pending_pages = sorted(list(set(pending_pages)))
+        
+        return pending_pages
+
+    def retry_failed_pages(self, csv_filename: str, json_filename: str, max_workers: int = 3):
+        """根据进度文件对失败页面进行补偿查询"""
+        progress_filename = csv_filename.replace('.csv', '_progress.json')
+        progress = self._load_progress(progress_filename)
+        if not progress:
+            print("未找到进度文件，跳过失败页面补偿")
             return
-        
-        print(f"\n找到 {len(publications)} 篇文章:\n")
-        print("=" * 80)
-        
-        for i, pub in enumerate(publications, 1):
-            print(f"\n文章 {i}:")
-            print(f"标题: {pub['title']}")
-            print(f"日期: {pub['date']}")
-            print(f"作者: {pub['authors']}")
-            print(f"期刊: {pub.get('journal', '')}")
-            print(f"发布日期: {pub.get('publish_date', '')}")
-            print(f"PubMed ID: {pub.get('pubmed_id', '')}")
-            print(f"DOI: {pub.get('doi', '')}")
-            print(f"链接: {pub['link']}")
-            abstract = pub.get('abstract', '')
-            if abstract:
-                display_abstract = abstract if len(abstract) <= 300 else abstract[:300] + "..."
-                print(f"摘要: {display_abstract}")
-            print("-" * 80)
+        failed_pages = sorted(set(progress.get('failed_pages', [])))
+        if not failed_pages:
+            print("没有需要补偿的失败页面")
+            return
+        print(f"开始补偿失败页面，共 {len(failed_pages)} 页: {failed_pages[:10]}{'...' if len(failed_pages)>10 else ''}")
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_page = {}
+            for page_num in failed_pages:
+                future = executor.submit(
+                    self._fetch_page_concurrent,
+                    page_num,
+                    csv_filename,
+                    json_filename,
+                    progress_filename
+                )
+                future_to_page[future] = page_num
+            for future in as_completed(future_to_page):
+                page_num = future_to_page[future]
+                try:
+                    _ = future.result()
+                except Exception as e:
+                    print(f"补偿页面 {page_num} 失败: {e}")
+
+    def retry_incomplete_details(self, csv_filename: str):
+        """对CSV中详情未完成（details_saved=否）的文章进行补偿查询"""
+        if not os.path.exists(csv_filename):
+            print("CSV文件不存在，无法进行详情补偿")
+            return
+        rows = []
+        pending = []
+        with self.file_lock:
+            with open(csv_filename, 'r', encoding='utf-8-sig', newline='') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    rows.append(row)
+                    if str(row.get('details_saved', '')).strip() in ['', '否', 'No', 'False', '0']:
+                        pending.append(row)
+        if not pending:
+            print("没有待补偿详情的文章")
+            return
+        print(f"开始补偿未完成详情的文章，共 {len(pending)} 篇")
+        # 逐条补偿，避免过多浏览器实例
+        fixed = 0
+        for pub in pending:
+            pub_info = {
+                'title': pub.get('title',''),
+                'link': pub.get('link','')
+            }
+            if not pub_info['link']:
+                continue
+            ok = self._fetch_article_details_simple(pub_info, csv_filename)
+            if ok:
+                fixed += 1
+        print(f"详情补偿完成，修复 {fixed}/{len(pending)} 篇")
     
-    def close(self):
-        """关闭浏览器"""
-        if self.driver:
-            self.driver.quit()
-            print("浏览器已关闭")
-    
-    def _fetch_page_concurrent(self, keyword: str, page_num: int, csv_filename: str, json_filename: str) -> Dict[str, any]:
+    def _update_progress(self, page_num: int, success: bool, articles_count: int, progress_filename: str):
+        """更新进度"""
+        with self.progress_lock:
+            progress = self._load_progress(progress_filename)
+            
+            if success:
+                # 添加到已完成列表
+                completed = progress.get('completed_pages', [])
+                if page_num not in completed:
+                    completed.append(page_num)
+                progress['completed_pages'] = completed
+                
+                # 从失败列表中移除（如果存在）
+                failed = progress.get('failed_pages', [])
+                if page_num in failed:
+                    failed.remove(page_num)
+                progress['failed_pages'] = failed
+                
+                # 更新文章计数
+                progress['total_articles'] = progress.get('total_articles', 0) + articles_count
+            else:
+                # 添加到失败列表
+                failed = progress.get('failed_pages', [])
+                if page_num not in failed:
+                    failed.append(page_num)
+                progress['failed_pages'] = failed
+            
+            self._save_progress(progress, progress_filename)
+
+    def _fetch_page_concurrent(self, page_num: int, csv_filename: str, json_filename: str, progress_filename: str) -> Dict[str, any]:
         """
-        使用独立浏览器实例爬取单个页面（支持并发）
+        使用独立浏览器实例爬取单个页面（支持并发和进度更新）
         
         Args:
-            keyword: 搜索关键词
             page_num: 页码
             csv_filename: CSV文件名
             json_filename: JSON文件名
+            progress_filename: 进度文件名
             
         Returns:
             包含爬取结果的字典 {'page': int, 'success': bool, 'articles_count': int, 'error': str}
@@ -783,6 +679,11 @@ class UKBiobankScraperSelenium:
         }
         
         try:
+            # 检查是否应该停止
+            if self.should_stop:
+                result['error'] = "程序已停止"
+                return result
+            
             # 创建独立的浏览器实例
             driver = self._create_driver(self.headless)
             
@@ -790,8 +691,11 @@ class UKBiobankScraperSelenium:
                 result['error'] = "无法创建浏览器实例"
                 return result
             
+            # 将驱动添加到活跃列表
+            self.active_drivers.append(driver)
+            
             # 构建URL并访问
-            url = f"{self.base_url}?_keyword={keyword}&_paged={page_num}"
+            url = f"{self.base_url}?_publication_date=2020-01-01%2C&_paged={page_num}"
             driver.get(url)
             time.sleep(3)
             
@@ -820,6 +724,10 @@ class UKBiobankScraperSelenium:
             for li in article_items:
                 pub_info = self._extract_article_info_from_list(li)
                 if pub_info and pub_info['link']:
+                    # 标注页码与详情完成标记（默认否），先写入占位行
+                    pub_info['page'] = page_num
+                    pub_info['details_saved'] = '否'
+                    self.upsert_to_csv(pub_info, csv_filename)
                     valid_articles.append(pub_info)
             
             if not valid_articles:
@@ -833,6 +741,8 @@ class UKBiobankScraperSelenium:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_article = {}
                 for idx, pub_info in enumerate(valid_articles, 1):
+                    if self.should_stop:
+                        break
                     future = executor.submit(
                         self._fetch_article_details_simple,
                         pub_info,
@@ -842,6 +752,8 @@ class UKBiobankScraperSelenium:
                 
                 # 等待所有任务完成
                 for future in as_completed(future_to_article):
+                    if self.should_stop:
+                        break
                     try:
                         if future.result():
                             successful_count += 1
@@ -852,6 +764,9 @@ class UKBiobankScraperSelenium:
             result['articles_count'] = successful_count
             
             # 更新进度
+            self._update_progress(page_num, True, successful_count, progress_filename)
+            
+            # 更新计数器
             with self.progress_lock:
                 self.pages_completed += 1
                 self.articles_completed += successful_count
@@ -860,12 +775,16 @@ class UKBiobankScraperSelenium:
             
         except Exception as e:
             result['error'] = str(e)
+            # 更新失败进度
+            self._update_progress(page_num, False, 0, progress_filename)
             return result
         finally:
             # 确保关闭浏览器实例
             if driver:
                 try:
                     driver.quit()
+                    if driver in self.active_drivers:
+                        self.active_drivers.remove(driver)
                 except:
                     pass
     
@@ -898,31 +817,67 @@ class UKBiobankScraperSelenium:
             
             # 提取详细信息
             details = {
-                'publish_date': '',
-                'pubmed_id': '',
-                'doi': '',
-                'abstract': ''
+                'disease_areas': [],  # 疾病领域数组
+                'last_updated': '',   # 最后更新时间
+                'authors': '',        # 作者
+                'publish_date': '',   # 发布日期
+                'journal': '',        # 期刊
+                'pubmed_id': '',      # PubMed ID
+                'doi': '',           # DOI
+                'abstract': ''        # 摘要
             }
             
-            # 提取meta信息
-            meta_items = soup.find_all('div', class_='meta__item')
-            for item in meta_items:
-                dt = item.find('dt')
-                dd = item.find('dd')
-                if dt and dd:
-                    dt_text = dt.get_text(strip=True).lower()
-                    dd_text = dd.get_text(strip=True)
-                    
-                    if 'publish date' in dt_text:
-                        details['publish_date'] = dd_text
-                    elif 'pubmed id' in dt_text:
-                        details['pubmed_id'] = dd_text
-                    elif 'doi' in dt_text:
-                        doi_link = dd.find('a')
-                        if doi_link:
-                            details['doi'] = doi_link.get_text(strip=True)
-                        else:
-                            details['doi'] = dd_text
+            # 提取articleHeader的三个部分
+            article_header = soup.find('header', class_='articleHeader')
+            if article_header:
+                # 第一部分：articleHeader__tags - Disease areas
+                tags_section = article_header.find('div', class_='articleHeader__tags')
+                if tags_section:
+                    # 查找Disease areas
+                    disease_areas_dt = tags_section.find('dt', string=lambda x: x and 'disease areas' in x.lower() if x else False)
+                    if disease_areas_dt:
+                        disease_areas_dd = disease_areas_dt.find_next_sibling('dd')
+                        if disease_areas_dd:
+                            # 提取所有tag
+                            tag_elements = disease_areas_dd.find_all('span', class_='tag')
+                            details['disease_areas'] = [tag.get_text(strip=True) for tag in tag_elements]
+                
+                # 第二部分：articleHeader__date - Last updated
+                date_section = article_header.find('div', class_='articleHeader__date')
+                if date_section:
+                    last_updated_dt = date_section.find('dt', string=lambda x: x and 'last updated' in x.lower() if x else False)
+                    if last_updated_dt:
+                        last_updated_dd = last_updated_dt.find_next_sibling('dd')
+                        if last_updated_dd:
+                            time_elem = last_updated_dd.find('time')
+                            if time_elem:
+                                details['last_updated'] = time_elem.get_text(strip=True)
+                
+                # 第三部分：articleHeader__meta - 作者、发布日期、期刊、PubMed ID、DOI
+                meta_section = article_header.find('div', class_='articleHeader__meta')
+                if meta_section:
+                    meta_items = meta_section.find_all('div', class_='meta__item')
+                    for item in meta_items:
+                        dt = item.find('dt')
+                        dd = item.find('dd')
+                        if dt and dd:
+                            dt_text = dt.get_text(strip=True).lower()
+                            dd_text = dd.get_text(strip=True)
+                            
+                            if 'author' in dt_text:
+                                details['authors'] = dd_text
+                            elif 'publish date' in dt_text:
+                                details['publish_date'] = dd_text
+                            elif 'journal' in dt_text:
+                                details['journal'] = dd_text
+                            elif 'pubmed id' in dt_text:
+                                details['pubmed_id'] = dd_text
+                            elif 'doi' in dt_text:
+                                doi_link = dd.find('a')
+                                if doi_link:
+                                    details['doi'] = doi_link.get_text(strip=True)
+                                else:
+                                    details['doi'] = dd_text
             
             # 提取摘要
             abstract_parts = []
@@ -944,11 +899,12 @@ class UKBiobankScraperSelenium:
             else:
                 details['abstract'] = '未找到摘要'
             
-            # 更新文章信息
+            # 更新文章信息与详情完成标记
             pub_info.update(details)
+            pub_info['details_saved'] = '是'
             
-            # 保存到CSV
-            self.append_to_csv(pub_info, csv_filename)
+            # 保存/更新到CSV（按link去重）
+            self.upsert_to_csv(pub_info, csv_filename)
             
             return True
             
@@ -962,24 +918,27 @@ class UKBiobankScraperSelenium:
                 except:
                     pass
     
-    def scrape_all_pages_concurrent(self, keyword: str = "heart", csv_filename: str = 'publications.csv', 
-                                    json_filename: str = 'publications.json', max_workers: int = 3) -> Dict[str, any]:
+    def scrape_all_pages_concurrent(self, csv_filename: str = 'publications.csv', 
+                                    json_filename: str = 'publications.json', max_workers: int = 3,
+                                    resume: bool = True) -> Dict[str, any]:
         """
-        使用页面级并发爬取所有页面
+        使用页面级并发爬取所有页面（支持断点续传）
         
         Args:
-            keyword: 搜索关键词
             csv_filename: CSV文件名
             json_filename: JSON文件名
             max_workers: 最大并发页面数（建议3-5）
+            resume: 是否启用断点续传
             
         Returns:
             包含统计信息的字典
         """
+        progress_filename = csv_filename.replace('.csv', '_progress.json')
+        
         try:
             # 获取总页数
             print(f"\n步骤 1: 检测总页数...")
-            total_pages = self.get_total_pages(keyword)
+            total_pages = self.get_total_pages()
             
             if total_pages <= 0:
                 print("无法确定总页数")
@@ -988,41 +947,86 @@ class UKBiobankScraperSelenium:
             print(f"✓ 检测到总页数: {total_pages}")
             print(f"✓ 预计文章数: {total_pages * 10} 篇（每页约10篇）")
             
+            # 断点续传逻辑
+            progress = {}
+            pending_pages = list(range(1, total_pages + 1))
+            
+            if resume:
+                progress = self._load_progress(progress_filename)
+                if progress:
+                    pending_pages = self._get_pending_pages(total_pages, progress)
+                    print(f"\n断点续传模式:")
+                    print(f"  - 待处理页面: {len(pending_pages)} 页")
+                    print(f"  - 已完成页面: {len(progress.get('completed_pages', []))} 页")
+                    print(f"  - 失败页面: {len(progress.get('failed_pages', []))} 页")
+                    
+                    if not pending_pages:
+                        print("\n✓ 所有页面已完成，无需继续爬取")
+                        return {'success': True, 'message': '所有页面已完成'}
+                else:
+                    print("\n首次运行模式")
+            else:
+                print("\n全新开始模式")
             # 清空现有文件
             if os.path.exists(csv_filename):
                 os.remove(csv_filename)
             if os.path.exists(json_filename):
                 os.remove(json_filename)
+                if os.path.exists(progress_filename):
+                    os.remove(progress_filename)
+            
+            # 初始化进度文件
+            if not progress:
+                progress = {
+                    'total_pages': total_pages,
+                    'completed_pages': [],
+                    'failed_pages': [],
+                    'total_articles': 0,
+                    'last_update': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'run_start_time': self.run_start_time,
+                    'filters': self.filter_query
+                }
+                self._save_progress(progress, progress_filename)
             
             # 重置计数器
-            self.pages_completed = 0
-            self.articles_completed = 0
-            self.total_saved = 0
+            self.pages_completed = len(progress.get('completed_pages', []))
+            self.articles_completed = progress.get('total_articles', 0)
+            self.total_saved = self.articles_completed
             
             print(f"\n步骤 2: 开始并发爬取（并发数: {max_workers}）...")
+            print("=" * 80)
+            print("提示: 按 Ctrl+C 可以安全停止程序并保存进度")
             print("=" * 80)
             
             start_time = time.time()
             
             # 使用线程池并发爬取页面
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                # 提交所有页面任务
+                # 提交待处理页面任务
                 future_to_page = {}
-                for page_num in range(1, total_pages + 1):
+                for page_num in pending_pages:
+                    if self.should_stop:
+                        print("\n检测到停止信号，取消剩余任务...")
+                        break
+                        
                     future = executor.submit(
                         self._fetch_page_concurrent,
-                        keyword,
                         page_num,
                         csv_filename,
-                        json_filename
+                        json_filename,
+                        progress_filename
                     )
                     future_to_page[future] = page_num
                 
                 # 处理完成的任务
-                successful_pages = 0
-                failed_pages = 0
+                successful_pages = len(progress.get('completed_pages', []))
+                failed_pages = len(progress.get('failed_pages', []))
                 
                 for future in as_completed(future_to_page):
+                    if self.should_stop:
+                        print("\n正在安全停止...")
+                        break
+                        
                     page_num = future_to_page[future]
                     try:
                         result = future.result()
@@ -1040,6 +1044,9 @@ class UKBiobankScraperSelenium:
                     except Exception as e:
                         failed_pages += 1
                         print(f"✗ 第 {page_num}/{total_pages} 页异常: {e}")
+                        
+                        # 更新失败页面进度
+                        self._update_progress(page_num, False, 0, progress_filename)
             
             elapsed_time = time.time() - start_time
             
@@ -1081,6 +1088,16 @@ class UKBiobankScraperSelenium:
                 print(f"  - 有摘要: {len([p for p in final_data if p.get('abstract') and p['abstract'] not in ['未找到摘要', '获取失败']])} 篇")
                 print(f"  - 有DOI: {len([p for p in final_data if p.get('doi')])} 篇")
                 print(f"  - 有PubMed ID: {len([p for p in final_data if p.get('pubmed_id')])} 篇")
+                print(f"  - 有疾病领域: {len([p for p in final_data if p.get('disease_areas') and p['disease_areas'] != ''])} 篇")
+                print(f"  - 有作者信息: {len([p for p in final_data if p.get('authors')])} 篇")
+            
+            # 主流程结束后，执行补偿逻辑
+            print("\n执行补偿逻辑: 失败页面与未完成详情补偿...")
+            try:
+                self.retry_failed_pages(csv_filename, json_filename, max_workers=max_workers)
+                self.retry_incomplete_details(csv_filename)
+            except Exception as e:
+                print(f"补偿逻辑执行出错: {e}")
             
             return {
                 'success': True,
@@ -1093,179 +1110,53 @@ class UKBiobankScraperSelenium:
             
         except Exception as e:
             print(f"\n程序执行出错: {e}")
-            return {'success': False, 'error': str(e)}
+    def close(self):
+        """关闭浏览器和清理资源"""
+        self.should_stop = True
+        self._force_cleanup()
+        print("爬虫已安全关闭")
 
 
 def main_concurrent():
-    """主函数 - 页面级并发爬取（推荐）"""
+    """主函数 - 页面级并发爬取（支持断点续传）"""
     scraper = None
     
     try:
         # 创建爬虫实例（headless=True为无头模式）
         scraper = UKBiobankScraperSelenium(headless=True)
         
-        # 目标参数
-        keyword = "heart"
-        
         print("=" * 80)
-        print("UK Biobank 爬虫 - 页面级并发模式（性能优化版）")
+        print("UK Biobank 爬虫 - 页面级并发模式（断点续传版）")
         print("=" * 80)
-        print(f"关键词: {keyword}")
-        print("目标: 获取所有相关文章（页面级并发）")
+        print("查询条件: 2020年1月1日后的所有文章")
+        print("目标: 获取所有相关文章（支持断点续传）")
         print("=" * 80)
         
         # 设置文件名
-        csv_filename = 'publications_heart_concurrent.csv'
-        json_filename = 'publications_heart_concurrent.json'
+        csv_filename = 'publications_2020_concurrent.csv'
+        json_filename = 'publications_2020_concurrent.json'
         
-        # 使用并发爬取（max_workers=3表示同时爬取3个页面）
+        # 使用并发爬取（支持断点续传）
         result = scraper.scrape_all_pages_concurrent(
-            keyword=keyword,
             csv_filename=csv_filename,
             json_filename=json_filename,
-            max_workers=3  # 可调整并发数（建议3-5，根据机器性能）
+            max_workers=3,  # 可调整并发数（建议3-5，根据机器性能）
+            resume=True     # 启用断点续传
         )
         
         if not result['success']:
             print(f"爬取失败: {result.get('error', '未知错误')}")
+        elif result.get('message'):
+            print(result['message'])
             
     except KeyboardInterrupt:
         print("\n\n用户中断程序")
         print("已获取的数据已实时保存到文件中")
+        print("进度已保存，下次运行将自动续传")
     except Exception as e:
         print(f"\n程序执行出错: {e}")
         print("已获取的数据已实时保存到文件中")
-    finally:
-        # 确保关闭浏览器
-        if scraper:
-            scraper.close()
-
-
-def main_sequential():
-    """主函数 - 顺序爬取模式（兼容旧版）"""
-    scraper = None
-    
-    try:
-        # 创建爬虫实例（headless=True为无头模式，False显示浏览器）
-        scraper = UKBiobankScraperSelenium(headless=True)
-        
-        # 目标参数
-        keyword = "heart"
-        
-        print("=" * 80)
-        print("UK Biobank 爬虫 - 顺序爬取模式")
-        print("=" * 80)
-        print(f"关键词: {keyword}")
-        print("目标: 获取所有相关文章（顺序+实时保存）")
-        print("=" * 80)
-        
-        # 第一步：检测总页数
-        print("\n步骤 1: 检测总页数...")
-        total_pages = scraper.get_total_pages(keyword)
-        
-        if total_pages <= 0:
-            print("无法确定总页数，请检查或手工指定总页数")
-            total_pages = 50
-            scraper.close()
-            return
-        
-        print(f"预计总页数: {total_pages}")
-        print(f"预计总文章数: {total_pages * 10} 篇（每页约10篇）")
-        
-        # 第二步：多线程逐页爬取
-        print(f"\n步骤 2: 开始顺序爬取...")
-        print("=" * 80)
-        
-        # 测试模式：只爬取前5页
-        test_mode = False
-        max_pages = 5 if test_mode else total_pages
-        
-        # 设置文件名
-        csv_filename = 'publications_heart_sequential.csv'
-        json_filename = 'publications_heart_sequential.json'
-        
-        # 清空现有文件
-        if os.path.exists(csv_filename):
-            os.remove(csv_filename)
-        if os.path.exists(json_filename):
-            os.remove(json_filename)
-        
-        total_successful = 0
-        
-        for page_num in range(1, max_pages + 1):
-            try:
-                print(f"\n正在爬取第 {page_num}/{total_pages} 页...")
-                
-                # 获取页面
-                html = scraper.fetch_page(keyword=keyword, page=page_num)
-                
-                if not html:
-                    print(f"X 第 {page_num} 页获取失败，跳过")
-                    continue
-                
-                # 多线程解析文章信息并实时保存
-                successful_count = scraper.parse_publications_multithread(
-                    html, page_num, csv_filename, json_filename
-                )
-                
-                if successful_count > 0:
-                    total_successful += successful_count
-                    print(f"✓ 第 {page_num} 页完成，成功获取 {successful_count} 篇文章")
-                    print(f"  累计获取: {total_successful} 篇文章")
-                else:
-                    print(f"! 第 {page_num} 页未找到文章，可能已到最后一页")
-                    # 如果连续几页都没有文章，提前结束
-                    break
-                
-                # 添加延迟避免请求过快
-                time.sleep(2)
-                
-            except Exception as e:
-                print(f"X 第 {page_num} 页处理出错: {e}")
-                continue
-        
-        # 第三步：生成JSON文件并显示最终统计
-        print("\n" + "=" * 80)
-        print("步骤 3: 生成JSON文件并统计...")
-        print("=" * 80)
-        
-        if total_successful > 0:
-            # 从CSV文件读取数据生成JSON文件
-            try:
-                final_data = []
-                with open(csv_filename, 'r', encoding='utf-8-sig') as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        final_data.append(row)
-                
-                # 保存JSON文件
-                with open(json_filename, 'w', encoding='utf-8') as f:
-                    json.dump(final_data, f, ensure_ascii=False, indent=2)
-                
-                print(f"\n✓ 爬取完成！")
-                print(f"总共获取: {total_successful} 篇文章")
-                print(f"数据已保存到:")
-                print(f"  - {csv_filename}")
-                print(f"  - {json_filename}")
-                
-                print(f"\n统计信息:")
-                print(f"  - 有摘要的文章: {len([p for p in final_data if p.get('abstract') and p['abstract'] not in ['未找到摘要', '获取失败']])}")
-                print(f"  - 有DOI的文章: {len([p for p in final_data if p.get('doi')])}")
-                print(f"  - 有PubMed ID的文章: {len([p for p in final_data if p.get('pubmed_id')])}")
-                
-            except Exception as e:
-                print(f"生成JSON文件失败: {e}")
-                print(f"CSV文件已保存: {csv_filename}")
-            
-        else:
-            print("\nX 未能获取到任何文章")
-            
-    except KeyboardInterrupt:
-        print("\n\n用户中断程序")
-        print("已获取的数据已实时保存到文件中")
-    except Exception as e:
-        print(f"\n程序执行出错: {e}")
-        print("已获取的数据已实时保存到文件中")
+        print("进度已保存，下次运行将自动续传")
     finally:
         # 确保关闭浏览器
         if scraper:
@@ -1274,23 +1165,7 @@ def main_sequential():
 
 def main():
     """主函数入口"""
-    import sys
-    
-    # 如果提供了命令行参数，根据参数选择模式
-    if len(sys.argv) > 1:
-        mode = sys.argv[1].lower()
-        if mode == 'sequential':
-            print("使用顺序爬取模式...")
-            main_sequential()
-        elif mode == 'concurrent':
-            print("使用并发爬取模式...")
-            main_concurrent()
-        else:
-            print("未知模式，使用默认并发模式...")
-            main_concurrent()
-    else:
-        # 默认使用并发模式（性能更好）
-        main_concurrent()
+    main_concurrent()
 
 
 if __name__ == "__main__":
