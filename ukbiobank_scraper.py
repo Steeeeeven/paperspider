@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-UK Biobank出版物爬虫 - Selenium版本
-使用Selenium浏览器自动化绕过反爬虫机制
+UK Biobank Publications Scraper - Selenium Version
+Using Selenium browser automation to bypass anti-crawling mechanisms
 """
 
 import sys
@@ -11,7 +11,7 @@ import signal
 import atexit
 import psutil
 
-# 修复Windows控制台编码问题
+# Fix Windows console encoding issues
 if sys.platform == 'win32':
     os.system('chcp 65001 >nul 2>&1')
 
@@ -103,11 +103,11 @@ class UKBiobankScraperSelenium:
                 try:
                     if 'chrome' in proc.info['name'].lower():
                         proc.terminate()
-                        print(f"已终止Chrome进程: {proc.info['pid']}")
+                        print("Terminated Chrome process:", proc.info['pid'])
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
         except Exception as e:
-            print(f"清理Chrome进程时出错: {e}")
+            print("Error cleaning Chrome processes:", e)
     
     @staticmethod
     def _create_driver(headless=True):
@@ -150,7 +150,7 @@ class UKBiobankScraperSelenium:
             return driver
             
         except Exception as e:
-            print(f"创建WebDriver失败: {e}")
+            print("Failed to create WebDriver:", e)
             return None
     
     def _init_driver(self):
@@ -164,7 +164,7 @@ class UKBiobankScraperSelenium:
                 raise Exception("无法创建WebDriver实例")
             
         except Exception as e:
-            print(f"初始化WebDriver失败: {e}")
+            print("初始化WebDriver失败:", e)
             print("\n请确保：")
             print("1. 已安装 Chrome 浏览器")
             print("2. 已安装 selenium: pip install selenium")
@@ -188,8 +188,8 @@ class UKBiobankScraperSelenium:
         
         try:
             # 直接访问搜索页面（不添加page参数）
-            url = f"{self.base_url}?_publication_date=2020-01-01%2C"
-            print(f"正在检测总页数: {url}")
+            url = self.base_url + "?_publication_date=2020-01-01%2C"
+            print("正在检测总页数:", url)
             
             self.driver.get(url)
             time.sleep(2)
@@ -596,37 +596,101 @@ class UKBiobankScraperSelenium:
                 except Exception as e:
                     print(f"补偿页面 {page_num} 失败: {e}")
 
-    def retry_incomplete_details(self, csv_filename: str):
-        """对CSV中详情未完成（details_saved=否）的文章进行补偿查询"""
+    def fetch_all_article_details(self, csv_filename: str, max_workers: int = 10) -> Dict[str, any]:
+        """
+        第二阶段：获取所有文章的详细信息
+        
+        Args:
+            csv_filename: CSV文件名
+            max_workers: 最大并发数
+            
+        Returns:
+            包含统计信息的字典
+        """
         if not os.path.exists(csv_filename):
-            print("CSV文件不存在，无法进行详情补偿")
-            return
-        rows = []
-        pending = []
+            print("CSV文件不存在，无法获取详情")
+            return {'success': False, 'error': 'CSV文件不存在'}
+        
+        # 读取所有需要获取详情的文章
+        articles_to_process = []
         with self.file_lock:
             with open(csv_filename, 'r', encoding='utf-8-sig', newline='') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
-                    rows.append(row)
                     if str(row.get('details_saved', '')).strip() in ['', '否', 'No', 'False', '0']:
-                        pending.append(row)
-        if not pending:
-            print("没有待补偿详情的文章")
-            return
-        print(f"开始补偿未完成详情的文章，共 {len(pending)} 篇")
-        # 逐条补偿，避免过多浏览器实例
-        fixed = 0
-        for pub in pending:
-            pub_info = {
-                'title': pub.get('title',''),
-                'link': pub.get('link','')
-            }
-            if not pub_info['link']:
-                continue
-            ok = self._fetch_article_details_simple(pub_info, csv_filename)
-            if ok:
-                fixed += 1
-        print(f"详情补偿完成，修复 {fixed}/{len(pending)} 篇")
+                        articles_to_process.append(row)
+        
+        if not articles_to_process:
+            print("所有文章详情已获取完成")
+            return {'success': True, 'message': '所有文章详情已获取完成'}
+        
+        print(f"\n开始获取 {len(articles_to_process)} 篇文章的详细信息...")
+        print("=" * 80)
+        
+        start_time = time.time()
+        successful_count = 0
+        failed_count = 0
+        
+        # 使用线程池并发获取详情
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_article = {}
+            for idx, article in enumerate(articles_to_process, 1):
+                if self.should_stop:
+                    print("\n检测到停止信号，取消剩余任务...")
+                    break
+                    
+                pub_info = {
+                    'title': article.get('title', ''),
+                    'link': article.get('link', '')
+                }
+                
+                if not pub_info['link']:
+                    continue
+                    
+                future = executor.submit(
+                    self._fetch_article_details_simple,
+                    pub_info,
+                    csv_filename
+                )
+                future_to_article[future] = (idx, article)
+            
+            # 处理完成的任务
+            for future in as_completed(future_to_article):
+                if self.should_stop:
+                    print("\n正在安全停止...")
+                    break
+                    
+                idx, article = future_to_article[future]
+                try:
+                    if future.result():
+                        successful_count += 1
+                        print(f"✓ 第 {idx}/{len(articles_to_process)} 篇文章详情获取成功: {article['title'][:50]}...")
+                    else:
+                        failed_count += 1
+                        print(f"✗ 第 {idx}/{len(articles_to_process)} 篇文章详情获取失败: {article['title'][:50]}...")
+                except Exception as e:
+                    failed_count += 1
+                    print(f"✗ 第 {idx}/{len(articles_to_process)} 篇文章详情获取异常: {e}")
+        
+        elapsed_time = time.time() - start_time
+        
+        print("\n" + "=" * 80)
+        print("详情获取完成！")
+        print("=" * 80)
+        print(f"总文章数: {len(articles_to_process)}")
+        print(f"成功获取: {successful_count}")
+        print(f"获取失败: {failed_count}")
+        print(f"耗时: {elapsed_time:.2f} 秒")
+        if elapsed_time > 0:
+            print(f"平均速度: {successful_count / elapsed_time:.2f} 篇/秒")
+        
+        return {
+            'success': True,
+            'total_articles': len(articles_to_process),
+            'successful_count': successful_count,
+            'failed_count': failed_count,
+            'elapsed_time': elapsed_time
+        }
     
     def _update_progress(self, page_num: int, success: bool, articles_count: int, progress_filename: str):
         """更新进度"""
@@ -657,14 +721,13 @@ class UKBiobankScraperSelenium:
             
             self._save_progress(progress, progress_filename)
 
-    def _fetch_page_concurrent(self, page_num: int, csv_filename: str, json_filename: str, progress_filename: str) -> Dict[str, any]:
+    def _fetch_page_links_only(self, page_num: int, csv_filename: str, progress_filename: str) -> Dict[str, any]:
         """
-        使用独立浏览器实例爬取单个页面（支持并发和进度更新）
+        第一阶段：只获取页面中的文章链接，不获取详情
         
         Args:
             page_num: 页码
             csv_filename: CSV文件名
-            json_filename: JSON文件名
             progress_filename: 进度文件名
             
         Returns:
@@ -719,7 +782,7 @@ class UKBiobankScraperSelenium:
             
             article_items = post_list.find_all('li')
             
-            # 提取有效文章
+            # 提取有效文章链接
             valid_articles = []
             for li in article_items:
                 pub_info = self._extract_article_info_from_list(li)
@@ -734,42 +797,16 @@ class UKBiobankScraperSelenium:
                 result['error'] = "页面无有效文章"
                 return result
             
-            # 使用多线程获取文章详情
-            successful_count = 0
-            max_workers = min(len(valid_articles), 5)  # 每个页面最多5个线程
-            
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_article = {}
-                for idx, pub_info in enumerate(valid_articles, 1):
-                    if self.should_stop:
-                        break
-                    future = executor.submit(
-                        self._fetch_article_details_simple,
-                        pub_info,
-                        csv_filename
-                    )
-                    future_to_article[future] = pub_info
-                
-                # 等待所有任务完成
-                for future in as_completed(future_to_article):
-                    if self.should_stop:
-                        break
-                    try:
-                        if future.result():
-                            successful_count += 1
-                    except Exception as e:
-                        print(f"  [页面{page_num}] 文章获取失败: {e}")
-            
             result['success'] = True
-            result['articles_count'] = successful_count
+            result['articles_count'] = len(valid_articles)
             
             # 更新进度
-            self._update_progress(page_num, True, successful_count, progress_filename)
+            self._update_progress(page_num, True, len(valid_articles), progress_filename)
             
             # 更新计数器
             with self.progress_lock:
                 self.pages_completed += 1
-                self.articles_completed += successful_count
+                self.articles_completed += len(valid_articles)
             
             return result
             
@@ -922,7 +959,7 @@ class UKBiobankScraperSelenium:
                                     json_filename: str = 'publications.json', max_workers: int = 3,
                                     resume: bool = True) -> Dict[str, any]:
         """
-        使用页面级并发爬取所有页面（支持断点续传）
+        使用两阶段爬取：先获取所有文章链接，再获取详情（支持断点续传）
         
         Args:
             csv_filename: CSV文件名
@@ -961,8 +998,10 @@ class UKBiobankScraperSelenium:
                     print(f"  - 失败页面: {len(progress.get('failed_pages', []))} 页")
                     
                     if not pending_pages:
-                        print("\n✓ 所有页面已完成，无需继续爬取")
-                        return {'success': True, 'message': '所有页面已完成'}
+                        print("\n✓ 所有页面链接已获取完成，进入详情获取阶段")
+                        # 直接进入第二阶段
+                        detail_result = self.fetch_all_article_details(csv_filename, max_workers=max_workers)
+                        return {'success': True, 'stage': 'details_only', 'detail_result': detail_result}
                 else:
                     print("\n首次运行模式")
             else:
@@ -993,7 +1032,7 @@ class UKBiobankScraperSelenium:
             self.articles_completed = progress.get('total_articles', 0)
             self.total_saved = self.articles_completed
             
-            print(f"\n步骤 2: 开始并发爬取（并发数: {max_workers}）...")
+            print(f"\n步骤 2: 开始第一阶段 - 获取所有文章链接（并发数: {max_workers}）...")
             print("=" * 80)
             print("提示: 按 Ctrl+C 可以安全停止程序并保存进度")
             print("=" * 80)
@@ -1010,10 +1049,9 @@ class UKBiobankScraperSelenium:
                         break
                         
                     future = executor.submit(
-                        self._fetch_page_concurrent,
+                        self._fetch_page_links_only,
                         page_num,
                         csv_filename,
-                        json_filename,
                         progress_filename
                     )
                     future_to_page[future] = page_num
@@ -1033,26 +1071,45 @@ class UKBiobankScraperSelenium:
                         
                         if result['success']:
                             successful_pages += 1
-                            print(f"✓ 第 {result['page']}/{total_pages} 页完成 | "
+                            print(f"✓ 第 {result['page']}/{total_pages} 页链接获取完成 | "
                                   f"文章数: {result['articles_count']} | "
                                   f"累计: {self.articles_completed} 篇 | "
                                   f"进度: {self.pages_completed}/{total_pages}")
                         else:
                             failed_pages += 1
-                            print(f"✗ 第 {result['page']}/{total_pages} 页失败: {result['error']}")
+                            print(f"✗ 第 {result['page']}/{total_pages} 页链接获取失败: {result['error']}")
                         
                     except Exception as e:
                         failed_pages += 1
-                        print(f"✗ 第 {page_num}/{total_pages} 页异常: {e}")
+                        print(f"✗ 第 {page_num}/{total_pages} 页链接获取异常: {e}")
                         
                         # 更新失败页面进度
                         self._update_progress(page_num, False, 0, progress_filename)
             
             elapsed_time = time.time() - start_time
             
-            # 生成JSON文件
+            # 第一阶段补偿：重试失败的页面
+            print("\n执行第一阶段补偿: 重试失败的页面...")
+            try:
+                self.retry_failed_pages(csv_filename, json_filename, max_workers=max_workers)
+            except Exception as e:
+                print(f"第一阶段补偿执行出错: {e}")
+            
             print("\n" + "=" * 80)
-            print("步骤 3: 生成JSON文件...")
+            print("第一阶段完成 - 所有文章链接已获取！")
+            print("=" * 80)
+            print(f"总页数: {total_pages}")
+            print(f"成功页数: {successful_pages}")
+            print(f"失败页数: {failed_pages}")
+            print(f"总文章数: {self.articles_completed}")
+            print(f"耗时: {elapsed_time:.2f} 秒")
+            
+            # 第二阶段：获取所有文章的详细信息
+            print("\n步骤 3: 开始第二阶段 - 获取所有文章详细信息...")
+            detail_result = self.fetch_all_article_details(csv_filename, max_workers=max_workers)
+            
+            # 生成JSON文件
+            print("\n步骤 4: 生成JSON文件...")
             
             try:
                 final_data = []
@@ -1069,7 +1126,7 @@ class UKBiobankScraperSelenium:
             except Exception as e:
                 print(f"✗ JSON文件生成失败: {e}")
             
-            # 统计信息
+            # 最终统计信息
             print("\n" + "=" * 80)
             print("爬取完成！")
             print("=" * 80)
@@ -1077,8 +1134,9 @@ class UKBiobankScraperSelenium:
             print(f"成功页数: {successful_pages}")
             print(f"失败页数: {failed_pages}")
             print(f"总文章数: {self.articles_completed}")
-            print(f"耗时: {elapsed_time:.2f} 秒")
-            print(f"平均速度: {self.articles_completed / elapsed_time:.2f} 篇/秒")
+            print(f"详情获取成功: {detail_result.get('successful_count', 0)}")
+            print(f"详情获取失败: {detail_result.get('failed_count', 0)}")
+            print(f"总耗时: {elapsed_time + detail_result.get('elapsed_time', 0):.2f} 秒")
             print(f"\n文件位置:")
             print(f"  - CSV: {csv_filename}")
             print(f"  - JSON: {json_filename}")
@@ -1091,25 +1149,9 @@ class UKBiobankScraperSelenium:
                 print(f"  - 有疾病领域: {len([p for p in final_data if p.get('disease_areas') and p['disease_areas'] != ''])} 篇")
                 print(f"  - 有作者信息: {len([p for p in final_data if p.get('authors')])} 篇")
             
-            # 主流程结束后，执行补偿逻辑
-            print("\n执行补偿逻辑: 失败页面与未完成详情补偿...")
-            try:
-                self.retry_failed_pages(csv_filename, json_filename, max_workers=max_workers)
-                self.retry_incomplete_details(csv_filename)
-            except Exception as e:
-                print(f"补偿逻辑执行出错: {e}")
-            
-            return {
-                'success': True,
-                'total_pages': total_pages,
-                'successful_pages': successful_pages,
-                'failed_pages': failed_pages,
-                'total_articles': self.articles_completed,
-                'elapsed_time': elapsed_time
-            }
-            
         except Exception as e:
             print(f"\n程序执行出错: {e}")
+            return {'success': False, 'error': str(e)}
     def close(self):
         """关闭浏览器和清理资源"""
         self.should_stop = True
