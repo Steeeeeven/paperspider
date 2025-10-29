@@ -30,7 +30,6 @@ import csv
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import queue
 from datetime import datetime
 
 
@@ -259,237 +258,9 @@ class UKBiobankScraperSelenium:
         
         return info if info['title'] and info['link'] else None
     
-    def _fetch_article_details_multithread(self, url, max_retries=3):
-        """访问论文详情页获取完整信息（多线程版本，使用独立浏览器实例，带重试机制）"""
-        details = {
-            'disease_areas': [],  # 疾病领域数组
-            'last_updated': '',   # 最后更新时间
-            'authors': '',        # 作者
-            'publish_date': '',   # 发布日期
-            'journal': '',        # 期刊
-            'pubmed_id': '',      # PubMed ID
-            'doi': '',           # DOI
-            'abstract': ''        # 摘要
-        }
-        
-        if not url:
-            return details
-        
-        for attempt in range(max_retries):
-            driver = None
-            try:
-                # 创建独立的Chrome实例
-                chrome_options = Options()
-                if self.headless:
-                    chrome_options.add_argument('--headless')
-                
-                # 添加选项以避免被检测
-                chrome_options.add_argument('--disable-blink-features=AutomationControlled')
-                chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-                chrome_options.add_experimental_option('useAutomationExtension', False)
-                chrome_options.add_argument('--no-sandbox')
-                chrome_options.add_argument('--disable-dev-shm-usage')
-                chrome_options.add_argument('--disable-gpu')
-                chrome_options.add_argument('--window-size=1920,1080')
-                chrome_options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
-                
-                # 使用更稳定的驱动管理方式
-                driver = None
-                driver_created = False
-                
-                # 方案1：尝试使用webdriver-manager（带重试机制）
-                for driver_attempt in range(3):
-                    try:
-                        service = Service(ChromeDriverManager().install())
-                        driver = webdriver.Chrome(service=service, options=chrome_options)
-                        driver_created = True
-                        break
-                    except Exception as e:
-                        print(f"  webdriver-manager尝试 {driver_attempt + 1}/3 失败: {e}")
-                        if driver_attempt < 2:  # 不是最后一次尝试
-                            time.sleep(2)  # 等待2秒后重试
-                            continue
-                
-                # 方案2：如果webdriver-manager失败，尝试使用系统PATH中的ChromeDriver
-                if not driver_created:
-                    try:
-                        driver = webdriver.Chrome(options=chrome_options)
-                        driver_created = True
-                    except Exception as e:
-                        print(f"  系统ChromeDriver也失败: {e}")
-                
-                # 方案3：如果都失败，尝试手动指定驱动路径
-                if not driver_created:
-                    try:
-                        # 尝试常见的ChromeDriver路径
-                        possible_paths = [
-                            r"C:\Program Files\Google\Chrome\Application\chromedriver.exe",
-                            r"C:\Program Files (x86)\Google\Chrome\Application\chromedriver.exe",
-                            r"C:\Users\{}\AppData\Local\Google\Chrome\Application\chromedriver.exe".format(os.getenv('USERNAME', '')),
-                            r"C:\chromedriver.exe"
-                        ]
-                        
-                        for path in possible_paths:
-                            if os.path.exists(path):
-                                service = Service(path)
-                                driver = webdriver.Chrome(service=service, options=chrome_options)
-                                driver_created = True
-                                print(f"  使用手动路径成功: {path}")
-                                break
-                    except Exception as e:
-                        print(f"  手动路径也失败: {e}")
-                
-                # 如果所有方案都失败，返回空结果
-                if not driver_created:
-                    print(f"  所有Chrome驱动方案都失败，跳过此文章 (尝试 {attempt + 1}/{max_retries})")
-                    if attempt < max_retries - 1:
-                        time.sleep((attempt + 1) * 2)
-                        continue
-                    return details
-                
-                # 访问详情页
-                driver.get(url)
-                time.sleep(3)  # 增加等待时间确保页面加载完成
-                
-                # 获取页面HTML
-                html = driver.page_source
-                
-                # 验证HTML是否有效
-                if not html or len(html) < 1000:
-                    print(f"  HTML内容异常，长度: {len(html) if html else 0} (尝试 {attempt + 1}/{max_retries})")
-                    if attempt < max_retries - 1:
-                        time.sleep((attempt + 1) * 2)
-                        continue
-                    return details
-                
-                soup = BeautifulSoup(html, 'html.parser')
-                
-                # 提取articleHeader的三个部分
-                article_header = soup.find('header', class_='articleHeader')
-                if article_header:
-                    # 第一部分：articleHeader__tags - Disease areas
-                    tags_section = article_header.find('div', class_='articleHeader__tags')
-                    if tags_section:
-                        # 查找Disease areas
-                        disease_areas_dt = tags_section.find('dt', string=lambda x: x and 'disease areas' in x.lower() if x else False)
-                        if disease_areas_dt:
-                            disease_areas_dd = disease_areas_dt.find_next_sibling('dd')
-                            if disease_areas_dd:
-                                # 提取所有tag
-                                tag_elements = disease_areas_dd.find_all('span', class_='tag')
-                                details['disease_areas'] = [tag.get_text(strip=True) for tag in tag_elements]
-                    
-                    # 第二部分：articleHeader__date - Last updated
-                    date_section = article_header.find('div', class_='articleHeader__date')
-                    if date_section:
-                        last_updated_dt = date_section.find('dt', string=lambda x: x and 'last updated' in x.lower() if x else False)
-                        if last_updated_dt:
-                            last_updated_dd = last_updated_dt.find_next_sibling('dd')
-                            if last_updated_dd:
-                                time_elem = last_updated_dd.find('time')
-                                if time_elem:
-                                    details['last_updated'] = time_elem.get_text(strip=True)
-                    
-                    # 第三部分：articleHeader__meta - 作者、发布日期、期刊、PubMed ID、DOI
-                    meta_section = article_header.find('div', class_='articleHeader__meta')
-                    if meta_section:
-                        meta_items = meta_section.find_all('div', class_='meta__item')
-                        for item in meta_items:
-                            dt = item.find('dt')
-                            dd = item.find('dd')
-                            if dt and dd:
-                                dt_text = dt.get_text(strip=True).lower()
-                                dd_text = dd.get_text(strip=True)
-                                
-                                if 'author' in dt_text:
-                                    details['authors'] = dd_text
-                                elif 'publish date' in dt_text:
-                                    details['publish_date'] = dd_text
-                                elif 'journal' in dt_text:
-                                    details['journal'] = dd_text
-                                elif 'pubmed id' in dt_text:
-                                    details['pubmed_id'] = dd_text
-                                elif 'doi' in dt_text:
-                                    # DOI可能包含链接，提取文本
-                                    doi_link = dd.find('a')
-                                    if doi_link:
-                                        details['doi'] = doi_link.get_text(strip=True)
-                                    else:
-                                        details['doi'] = dd_text
-                
-                # 提取摘要：找到 <h2>Abstract</h2> 后的所有 <p> 标签
-                abstract_parts = []
-                abstract_header = soup.find('h2', string=lambda x: x and 'abstract' in x.lower() if x else False)
-                
-                if abstract_header:
-                    # 获取h2后面的所有p标签，直到遇到下一个h2或h3
-                    current = abstract_header.find_next_sibling()
-                    while current:
-                        if current.name in ['h2', 'h3', 'h4']:
-                            break
-                        if current.name == 'p':
-                            text = current.get_text(strip=True)
-                            if text:
-                                abstract_parts.append(text)
-                        current = current.find_next_sibling()
-                
-                if abstract_parts:
-                    details['abstract'] = ' '.join(abstract_parts)
-                    print(f"  [调试] 找到摘要，长度: {len(details['abstract'])}")
-                else:
-                    details['abstract'] = '未找到摘要'
-                
-                # 验证是否获取到有效信息
-                if details['title'] or details['authors'] or details['abstract'] != '未找到摘要':
-                    print(f"  ✓ 文章详情获取成功 (尝试 {attempt + 1}/{max_retries})")
-                    return details
-                else:
-                    print(f"  ✗ 文章详情内容为空 (尝试 {attempt + 1}/{max_retries})")
-                    
-            except Exception as e:
-                print(f"  获取详细信息失败 (尝试 {attempt + 1}/{max_retries}): {e}")
-                
-            finally:
-                # 确保关闭独立的浏览器实例
-                if driver:
-                    try:
-                        driver.quit()
-                    except:
-                        pass
-            
-            # 如果不是最后一次尝试，等待后重试
-            if attempt < max_retries - 1:
-                wait_time = (attempt + 1) * 2
-                print(f"  等待 {wait_time} 秒后重试...")
-                time.sleep(wait_time)
-        
-        print(f"  ✗ 文章详情获取失败，已重试 {max_retries} 次")
-        return details
     
     
-    def append_to_csv(self, publication: Dict[str, str], filename: str = 'publications.csv'):
-        """线程安全地追加单篇文章到CSV文件"""
-        if not publication:
-            return
-        
-        with self.file_lock:
-            fieldnames = ['page', 'title', 'link', 'disease_areas', 'last_updated', 'authors', 'publish_date', 'journal', 'pubmed_id', 'doi', 'abstract', 'details_saved']
-            file_exists = os.path.exists(filename)
-            
-            # 处理disease_areas数组，转换为字符串
-            pub_copy = publication.copy()
-            if isinstance(pub_copy.get('disease_areas'), list):
-                pub_copy['disease_areas'] = '; '.join(pub_copy['disease_areas'])
-            
-            with open(filename, 'a', encoding='utf-8-sig', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                if not file_exists:
-                    writer.writeheader()
-                writer.writerow(pub_copy)
-            
-            self.total_saved += 1
-            # print(f"✓ 已保存第 {self.total_saved} 篇文章: {publication['title'][:50]}...")
-
+    
     def upsert_to_csv(self, publication: Dict[str, str], filename: str = 'publications.csv'):
         """按link作为唯一键进行CSV更新/插入，并保证字段齐全"""
         if not publication or not publication.get('link'):
@@ -590,10 +361,9 @@ class UKBiobankScraperSelenium:
             future_to_page = {}
             for page_num in failed_pages:
                 future = executor.submit(
-                    self._fetch_page_concurrent,
+                    self._fetch_page_links_only,
                     page_num,
                     csv_filename,
-                    json_filename,
                     progress_filename
                 )
                 future_to_page[future] = page_num
@@ -1011,10 +781,10 @@ class UKBiobankScraperSelenium:
                         detail_result = self.fetch_all_article_details(csv_filename, max_workers=max_workers)
                         return {'success': True, 'stage': 'details_only', 'detail_result': detail_result}
                 else:
-                    print("\n首次运行模式")
+                    print("\n首次运行模式（保留现有数据）")
             else:
                 print("\n全新开始模式")
-            # 清空现有文件
+                # 只有在全新开始模式下才清空现有文件
             if os.path.exists(csv_filename):
                 os.remove(csv_filename)
             if os.path.exists(json_filename):
